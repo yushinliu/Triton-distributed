@@ -1142,7 +1142,6 @@ setup(
     url="https://github.com/ByteDance-Seed/Triton-distributed",
     python_requires=PYTHON_REQUIRES,
     classifiers=CLASSIFIERS,
-    test_suite="tests",
     extras_require={
         "build": ["cmake>=3.20,<4.0", "lit", "ninja", "pybind11"],
         "tests": [

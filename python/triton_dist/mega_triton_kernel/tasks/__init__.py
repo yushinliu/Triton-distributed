@@ -22,7 +22,7 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
-from .linear import LinearTaskBuilder, MLPFC1TaskBuilder, QKVProjTaskBuilder, OProjTaskBuilder
+from .linear import LinearTaskBuilder, MLPFC1TaskBuilder, MLPFC1SiLUMulUpTaskBuilder, QKVProjTaskBuilder, OProjTaskBuilder
 from .activation import SiLUMulUpTaskBuilder
 from .allreduce import AllReduceTaskBuilder
 from .flash_decode import AttnSplitTaskBuilder, AttnCombineTaskBuilder
@@ -35,6 +35,7 @@ from .flash_attn import QKVPackFlashAttnTaskBuilder
 __all__ = [
     "LinearTaskBuilder",
     "MLPFC1TaskBuilder",
+    "MLPFC1SiLUMulUpTaskBuilder",
     "QKVProjTaskBuilder",
     "OProjTaskBuilder",
     "SiLUMulUpTaskBuilder",

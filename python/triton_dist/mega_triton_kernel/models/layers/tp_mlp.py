@@ -104,8 +104,12 @@ class TPMLPBuilder:
             assert ar_out is None
             fc2_out = torch.empty(num_tokens, hidden_size, dtype=x.dtype,
                                   device=x.device) if fc2_out is None else fc2_out
-        self._builder.make_fc1(x, self.gate_up_proj, fc1_output)
-        self._builder.make_silu_mul_up(fc1_output, act_out)
+        use_fused_fc1_silu = getattr(self._builder, "_enable_mlp_fc1_silu_fusion", False) and fc1_output is None
+        if use_fused_fc1_silu:
+            self._builder.make_fused_fc1_silu_mul_up(x, self.gate_up_proj, act_out)
+        else:
+            self._builder.make_fc1(x, self.gate_up_proj, fc1_output)
+            self._builder.make_silu_mul_up(fc1_output, act_out)
         self._builder.make_fc2(act_out, self.down_proj, fc2_out)
         if self.world_size > 1:
             self._builder.make_allreduce(fc2_out, ar_out, double_input_buffer=True)

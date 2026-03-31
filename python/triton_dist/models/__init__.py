@@ -26,21 +26,39 @@
 from transformers import AutoTokenizer as HFTokenizer
 
 from .config import ModelConfig
-from .dense import DenseLLM
-from .qwen_moe import Qwen3MoE
+
+DenseLLM = None
+Qwen3MoE = None
+_dense_import_error = None
+_qwen_moe_import_error = None
+
+try:
+    from .dense import DenseLLM
+except ImportError as e:
+    _dense_import_error = e
+
+try:
+    from .qwen_moe import Qwen3MoE
+except ImportError as e:
+    _qwen_moe_import_error = e
 
 
 class AutoLLM:
-    model_mapping = {
-        "Qwen/Qwen3-0.6B": DenseLLM,
-        "Qwen/Qwen3-8B": DenseLLM,
-        "Qwen/Qwen3-14B": DenseLLM,
-        "Qwen/Qwen3-32B": DenseLLM,
-        "Qwen/Qwen3-30B-A3B": Qwen3MoE,
-        "Qwen/Qwen3-235B-A22B": Qwen3MoE,
-        "meta-llama/Meta-Llama-3-70B": DenseLLM,
-        "ByteDance-Seed/Seed-OSS-36B-Instruct": DenseLLM,
-    }
+    model_mapping = {}
+    if DenseLLM is not None:
+        model_mapping.update({
+            "Qwen/Qwen3-0.6B": DenseLLM,
+            "Qwen/Qwen3-8B": DenseLLM,
+            "Qwen/Qwen3-14B": DenseLLM,
+            "Qwen/Qwen3-32B": DenseLLM,
+            "meta-llama/Meta-Llama-3-70B": DenseLLM,
+            "ByteDance-Seed/Seed-OSS-36B-Instruct": DenseLLM,
+        })
+    if Qwen3MoE is not None:
+        model_mapping.update({
+            "Qwen/Qwen3-30B-A3B": Qwen3MoE,
+            "Qwen/Qwen3-235B-A22B": Qwen3MoE,
+        })
 
     @staticmethod
     def from_pretrained(config: ModelConfig, group=None):
@@ -52,11 +70,21 @@ class AutoLLM:
 
         if model_name in AutoLLM.model_mapping:
             return AutoLLM.model_mapping[model_name](config, group)
-        else:
+        if DenseLLM is not None:
             print(f"Model {model_name} not found in model mapping, "
                   f"Available models: {list(AutoLLM.model_mapping.keys())} "
                   f"Falling back to DenseLLM with default configuration.")
             return DenseLLM(config, group)
+
+        if _dense_import_error is not None:
+            raise ImportError(
+                "DenseLLM is unavailable because optional model dependencies failed to import."
+            ) from _dense_import_error
+        if _qwen_moe_import_error is not None:
+            raise ImportError(
+                "Qwen3MoE is unavailable because optional model dependencies failed to import."
+            ) from _qwen_moe_import_error
+        raise ImportError("No model implementations are available.")
 
 
 class AutoTokenizer:

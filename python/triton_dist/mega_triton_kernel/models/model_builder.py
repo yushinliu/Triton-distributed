@@ -86,7 +86,7 @@ def check_alignment(tensors):
 class ModelBuilder:
 
     def __init__(self, rank=0, world_size=1, local_world_size=1, num_warps=4, enable_profiling=False,
-                 enable_dep_opt=True, enable_runtime_scheduler=False):
+                 enable_dep_opt=True, enable_runtime_scheduler=False, enable_mlp_fc1_silu_fusion=False):
         self.reset()
         self._registry = registry
         self._code_generator = CodeGenerator()
@@ -122,6 +122,7 @@ class ModelBuilder:
         self._enable_profiling = enable_profiling
         self._enable_dep_opt = enable_dep_opt
         self._enable_runtime_scheduler = enable_runtime_scheduler
+        self._enable_mlp_fc1_silu_fusion = enable_mlp_fc1_silu_fusion
         self._codegen_options = CodeGenOptions(enable_profiling=enable_profiling,
                                                enable_runtime_scheduler=enable_runtime_scheduler)
         self.task_types_to_str = None
@@ -228,6 +229,20 @@ class ModelBuilder:
 
     def make_fc1(self, input: torch.Tensor, weight: torch.Tensor, output: torch.Tensor, layer_id: int = 0):
         self._make_fc("mlp_fc1", input, weight, output, layer_id)
+
+    def make_fused_fc1_silu_mul_up(self, input: torch.Tensor, weight: torch.Tensor, output: torch.Tensor,
+                                   layer_id: int = 0):
+        check_tensor_dim(input, 2)
+        check_tensor_dim(weight, 2)
+        check_tensor_dim(output, 2)
+        M, K = input.shape
+        N2, wK = weight.shape
+        oM, oN = output.shape
+        assert K == wK
+        assert N2 == oN * 2
+        assert oM == M
+        assert K % 32 == 0
+        self._convert_op("mlp_fc1_silu_mul_up", layer_id, [[input, weight], [output]])
 
     def make_fc2(self, input: torch.Tensor, weight: torch.Tensor, output: torch.Tensor, layer_id: int = 0):
         self._make_fc("mlp_fc2", input, weight, output, layer_id)

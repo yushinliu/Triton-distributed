@@ -30,12 +30,9 @@ import logging
 import numpy as np
 import random
 import os
-from transformers import AutoModelForCausalLM, AutoConfig
-from accelerate import init_empty_weights
 
 if torch.version.cuda:
     PLATFORM = 'nvidia'
-    import flashinfer
 elif torch.version.hip:
     PLATFORM = 'amd'
 else:
@@ -88,6 +85,7 @@ def sample_token(logits: torch.Tensor, temperature=0.6, top_p=0.95, top_k=-1):
         if temperature == 0.0:
             token = logits.argmax(dim=-1, keepdim=True)
         else:
+            import flashinfer
             if temperature != 1.0:
                 logits = logits / temperature
             assert top_k == -1
@@ -106,6 +104,8 @@ def sample_token(logits: torch.Tensor, temperature=0.6, top_p=0.95, top_k=-1):
 
 @torch.no_grad()
 def init_model_cpu(model_name: str, dtype: torch.dtype):
+    from accelerate import init_empty_weights
+    from transformers import AutoConfig, AutoModelForCausalLM
     with torch.no_grad():
         random_params = os.environ.get("RANDOM_PARAMS", "0").lower() in ("1", "true", "yes")
         if random_params:

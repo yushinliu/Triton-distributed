@@ -22,7 +22,7 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
-from .mlp_fc1 import fc1_task_compute
+from .mlp_fc1 import fc1_task_compute, mlp_fc1_silu_mul_up_task_compute
 from .task_context import TaskBaseInfo
 from .activation import silu_mul_up_task_compute
 from .flash_decode import attn_gqa_fwd_batch_decode_combine_task_compute, attn_gqa_fwd_batch_decode_split_kv_task_compute
@@ -36,6 +36,7 @@ from .prefetch import prefetch_task_compute
 
 __all__ = [
     "fc1_task_compute",
+    "mlp_fc1_silu_mul_up_task_compute",
     "TaskBaseInfo",
     "silu_mul_up_task_compute",
     "attn_gqa_fwd_batch_decode_combine_task_compute",

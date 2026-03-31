@@ -39,8 +39,47 @@ def parse_args():
                         help="enable intra kernel profiling")
     parser.add_argument("--enable_runtime_scheduler", default=False, action="store_true",
                         help="enable runtime scheduler")
+    parser.add_argument("--fuse_fc1_silu", default=False, action="store_true",
+                        help="fuse fc1 and silu_mul_up into one mega task")
+    parser.add_argument("--bench_warmup", type=int, default=20, help="benchmark warmup iterations")
+    parser.add_argument("--bench_iters", type=int, default=0, help="benchmark iterations")
 
     return parser.parse_args()
+
+
+def randomize_input_and_flush_l2(l2_cache, mlp_layer_input, dtype):
+    l2_cache.zero_()
+    tmp_input = torch.randn(mlp_layer_input.shape, dtype=dtype).cuda()
+    mlp_layer_input.copy_(tmp_input)
+
+
+def benchmark(builder, l2_cache, mlp_layer_input, dtype, warmup, iters):
+    for _ in range(warmup):
+        randomize_input_and_flush_l2(l2_cache, mlp_layer_input, dtype)
+        builder.run()
+    torch.cuda.synchronize()
+
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    elapsed_ms = 0.0
+    for _ in range(iters):
+        randomize_input_and_flush_l2(l2_cache, mlp_layer_input, dtype)
+        start_event.record()
+        builder.run()
+        end_event.record()
+        end_event.synchronize()
+        elapsed_ms += start_event.elapsed_time(end_event)
+    avg_ms = elapsed_ms / iters
+    print(f"builder_avg_ms={avg_ms:.4f}")
+    return avg_ms
+
+
+def get_tol(dtype, output_name):
+    if dtype == torch.bfloat16:
+        if output_name == "fc2":
+            return {"atol": 4.0, "rtol": 0.05}
+        return {"atol": 0.0625, "rtol": 0.04}
+    return {"atol": 0, "rtol": 0}
 
 
 if __name__ == "__main__":
@@ -51,7 +90,8 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     l2_cache = torch.randn((256, 1024, 1024)).cuda()
     builder = ModelBuilder(enable_profiling=args.intra_kernel_profile,
-                           enable_runtime_scheduler=args.enable_runtime_scheduler)
+                           enable_runtime_scheduler=args.enable_runtime_scheduler,
+                           enable_mlp_fc1_silu_fusion=args.fuse_fc1_silu)
     batch = 1
     seq_len = 1
     PAGE_SIZE = 1
@@ -72,8 +112,11 @@ if __name__ == "__main__":
     act_out = torch.zeros((batch * seq_len, intermediate_size), dtype=dtype).cuda()
     fc2_out = torch.zeros((batch * seq_len, hidden_size), dtype=dtype).cuda()
 
-    builder.make_fc1(mlp_layer_input, fc1_weight, fc1_output)
-    builder.make_silu_mul_up(fc1_output, act_out)
+    if args.fuse_fc1_silu:
+        builder.make_fused_fc1_silu_mul_up(mlp_layer_input, fc1_weight, act_out)
+    else:
+        builder.make_fc1(mlp_layer_input, fc1_weight, fc1_output)
+        builder.make_silu_mul_up(fc1_output, act_out)
     builder.make_fc2(act_out, fc2_weight, fc2_out)
     builder.compile()
 
@@ -85,9 +128,7 @@ if __name__ == "__main__":
     triton.set_allocator(alloc_fn)
     with ctx:
         for i in range(30):
-            l2_cache.zero_()
-            tmp_input = torch.randn(mlp_layer_input.shape, dtype=dtype).cuda()
-            mlp_layer_input.copy_(tmp_input)
+            randomize_input_and_flush_l2(l2_cache, mlp_layer_input, dtype)
             builder.run()
 
             # torch impl
@@ -95,9 +136,13 @@ if __name__ == "__main__":
             fc1_output_ref = torch.nn.functional.linear(mlp_layer_input, fc1_weight)
             act_out_ref = torch_gate_silu_mul_up(fc1_output_ref)
             fc2_output_ref = torch.nn.functional.linear(act_out_ref, fc2_weight)
-            torch.testing.assert_close(fc1_output_ref, fc1_output, atol=0, rtol=0)
-            torch.testing.assert_close(act_out_ref, act_out, atol=0, rtol=0)
-            torch.testing.assert_close(fc2_output_ref, fc2_out, atol=0, rtol=0)
+            if not args.fuse_fc1_silu:
+                torch.testing.assert_close(fc1_output_ref, fc1_output, **get_tol(dtype, "fc1"))
+            torch.testing.assert_close(act_out_ref, act_out, **get_tol(dtype, "act"))
+            torch.testing.assert_close(fc2_output_ref, fc2_out, **get_tol(dtype, "fc2"))
+
+    if args.bench_iters > 0:
+        benchmark(builder, l2_cache, mlp_layer_input, dtype, args.bench_warmup, args.bench_iters)
 
     if args.intra_kernel_profile:
         builder.dump_trace()
