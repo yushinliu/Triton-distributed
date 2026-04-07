@@ -540,15 +540,15 @@ class ModelBuilder:
             builder_cls = self.get_task_builder("allreduce_nvshmem")
             kernel_config = builder_cls.create_config()
             num_tiles = (input.numel() + kernel_config.BLOCK_SIZE - 1) // kernel_config.BLOCK_SIZE
-            gather_buf = self.create_symm_tensor((num_tiles * self.local_world_size * kernel_config.BLOCK_SIZE, ),
-                                                 input.dtype)
+            scratch_buf = self.create_symm_tensor((num_tiles * self.local_world_size * kernel_config.BLOCK_SIZE, ),
+                                                  input.dtype)
         else:
             raise ValueError(f"Unsupported allreduce implementation: {implementation}")
         self.make_barrier_all_intra_node(wait_inputs=[input], layer_id=layer_id)
         if implementation == "multimem":
             self._convert_op("allreduce", layer_id, [[input], [output]])
         else:
-            self._convert_op("allreduce_nvshmem", layer_id, [[input, gather_buf], [output]])
+            self._convert_op("allreduce_nvshmem", layer_id, [[input, scratch_buf], [output]])
         if not double_input_buffer:
             self.make_barrier_all_intra_node(wait_inputs=[output], layer_id=layer_id)
 
