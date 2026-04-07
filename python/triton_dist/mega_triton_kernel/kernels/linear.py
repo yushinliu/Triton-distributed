@@ -97,3 +97,57 @@ def linear_task_compute(task_base_info: TaskBaseInfo, scoreboard: Scoreboard, BL
     tile_wise_matmul_compute(tile_id, a_ptr, b_ptr, c_ptr, M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
                              NUM_STAGES)
     scoreboard.release_tile(task_base_info, tile_id)
+
+
+@triton.jit
+def linear_add_task_compute(task_base_info: TaskBaseInfo, scoreboard: Scoreboard, BLOCK_SIZE_M: tl.constexpr,
+                            BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, NUM_STAGES: tl.constexpr,
+                            ALIGNMENT_K: tl.constexpr):
+    input: TensorDesc = task_base_info.get_tensor(0)
+    weight: TensorDesc = task_base_info.get_tensor(1)
+    residual: TensorDesc = task_base_info.get_tensor(2)
+    output: TensorDesc = task_base_info.get_tensor(3)
+
+    M = input.size(0)
+    K = input.size(1, ALIGNMENT_K)
+    N = weight.size(0)
+    a_ptr = input.data_ptr(tl.bfloat16)
+    b_ptr = weight.data_ptr(tl.bfloat16)
+    r_ptr = residual.data_ptr(tl.bfloat16)
+    c_ptr = output.data_ptr(tl.bfloat16)
+
+    tile_id = task_base_info.tile_id_or_start
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
+
+    pid_m = tile_id // num_pid_n
+    pid_n = tile_id % num_pid_n
+    start_m = pid_m * BLOCK_SIZE_M
+    start_n = pid_n * BLOCK_SIZE_N
+    offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = start_n + tl.arange(0, BLOCK_SIZE_N)
+    offs_am = tl.where(offs_am < M, offs_am, 0)
+    offs_bn = tl.where(offs_bn < N, offs_bn, 0)
+    offs_am = tl.max_contiguous(tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M)
+    offs_bn = tl.max_contiguous(tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for ki in tl.range(0, k_tiles, num_stages=NUM_STAGES):
+        offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+        a_ptrs = a_ptr + (offs_am[:, None] * K + offs_k[None, :])
+        b_ptrs = b_ptr + (offs_bn[:, None] * K + offs_k[None, :])
+
+        a = tl.load(a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0)
+        b = tl.load(b_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0)
+        accumulator = tl.dot(a, b.T, accumulator)
+
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    out_ptrs = c_ptr + N * offs_cm[:, None] + offs_cn[None, :]
+    residual_ptrs = r_ptr + N * offs_cm[:, None] + offs_cn[None, :]
+    out_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    residual_tile = tl.load(residual_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+    out = (accumulator + residual_tile).to(c_ptr.dtype.element_ty)
+    tl.store(out_ptrs, out, mask=out_mask)
+    scoreboard.release_tile(task_base_info, tile_id)

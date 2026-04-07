@@ -77,6 +77,19 @@ class MLPFC1SiLUMulUpTask(LinearTask):
 
 
 @dataclass
+class RMSNormMLPFC1SiLUMulUpConfig(LinearConfig):
+    pass
+
+
+@dataclass
+class RMSNormMLPFC1SiLUMulUpTask(LinearTask):
+    config: RMSNormMLPFC1SiLUMulUpConfig
+
+    def extra_params_to_tuple(self):
+        return ()
+
+
+@dataclass
 class QKVProjTask(LinearTask):
     config: LinearConfig
 
@@ -84,6 +97,16 @@ class QKVProjTask(LinearTask):
 @dataclass
 class OProjTask(LinearTask):
     config: LinearConfig
+
+
+@dataclass
+class OProjAddConfig(LinearConfig):
+    pass
+
+
+@dataclass
+class OProjAddTask(LinearTask):
+    config: OProjAddConfig
 
 
 def linear_config_factory(**kwargs) -> LinearConfig:
@@ -121,6 +144,28 @@ def mlp_fc1_silu_mul_up_config_factory(**kwargs) -> MLPFC1SiLUMulUpConfig:
     }
     default.update(kwargs)
     return MLPFC1SiLUMulUpConfig(**default)
+
+
+def rms_norm_mlp_fc1_silu_mul_up_config_factory(**kwargs) -> RMSNormMLPFC1SiLUMulUpConfig:
+    default = {
+        'BLOCK_SIZE_M': 16,
+        'BLOCK_SIZE_N': 64,
+        'BLOCK_SIZE_K': 128,
+        'NUM_STAGES': 3,
+    }
+    default.update(kwargs)
+    return RMSNormMLPFC1SiLUMulUpConfig(**default)
+
+
+def o_proj_add_config_factory(**kwargs) -> OProjAddConfig:
+    default = {
+        'BLOCK_SIZE_M': 16,
+        'BLOCK_SIZE_N': 128,
+        'BLOCK_SIZE_K': 64,
+        'NUM_STAGES': 5,
+    }
+    default.update(kwargs)
+    return OProjAddConfig(**default)
 
 
 def codegen_linear(task: LinearTask) -> str:
@@ -164,6 +209,16 @@ mlp_fc1_silu_mul_up_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={confi
     return code
 
 
+def codegen_rms_norm_mlp_fc1_silu_mul_up(task: RMSNormMLPFC1SiLUMulUpTask) -> str:
+    config: RMSNormMLPFC1SiLUMulUpConfig = task.config
+    code = f"""
+rms_norm_mlp_fc1_silu_mul_up_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
+                BLOCK_SIZE_N={config.BLOCK_SIZE_N}, BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES},
+                RMS_EPS={task.extra_params["rms_eps"]})
+"""
+    return code
+
+
 def codegen_qkv_proj(task: QKVProjTask) -> str:
     config: LinearConfig = task.config
     code = f"""
@@ -178,6 +233,15 @@ def codegen_o_proj(task: OProjTask) -> str:
     code = f"""
 fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
                 BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES})
+"""
+    return code
+
+
+def codegen_o_proj_add(task: OProjAddTask) -> str:
+    config: OProjAddConfig = task.config
+    code = f"""
+linear_add_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
+                BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES}, ALIGNMENT_K=16)
 """
     return code
 
@@ -308,6 +372,58 @@ class MLPFC1SiLUMulUpTaskBuilder(TaskBuilderBase):
         return cls._build_tasks_impl(device_prop, layer_id, dependency, io_tensors, extra_params)
 
 
+@registry.register_task(op_type="rms_norm_mlp_fc1_silu_mul_up", task_cls=RMSNormMLPFC1SiLUMulUpTask,
+                        config_factory=rms_norm_mlp_fc1_silu_mul_up_config_factory,
+                        codegen_func=codegen_rms_norm_mlp_fc1_silu_mul_up)
+class RMSNormMLPFC1SiLUMulUpTaskBuilder(TaskBuilderBase):
+
+    @classmethod
+    def get_problem_size(cls, io_tensors: List[List['torch.Tensor']], extra_params: Dict[str, Any]):
+        output = io_tensors[1][0]
+        M, N = output.shape
+        return (M, N)
+
+    @classmethod
+    def _build_tasks_impl(cls, device_prop, layer_id: int, dependency: TaskDependency, io_tensors, extra_params
+                          ) -> List[TaskBase]:
+        kernel_config = cls.create_config()
+        task_id = cls.get_task_id(layer_id)
+        BLOCK_SIZE_M = kernel_config.BLOCK_SIZE_M
+        BLOCK_SIZE_N = kernel_config.BLOCK_SIZE_N
+        M, N = cls.get_problem_size(io_tensors, extra_params)
+        num_tiles_m = cdiv(M, BLOCK_SIZE_M)
+        num_tiles_n = cdiv(N, BLOCK_SIZE_N)
+        num_tiles = num_tiles_m * num_tiles_n
+        x, rms_weight, w = io_tensors[0]
+        y = io_tensors[1][0]
+        tasks = []
+        cls.log(
+            f"RMSNormMLPFC1SiLUMulUp Task: M = {M}, N = {N}, num_tiles = {num_tiles}, num_sm = {device_prop.NUM_SMS}, dependency = {dependency}"
+        )
+        for tm in range(num_tiles_m):
+            for tn in range(num_tiles_n):
+                tile_id = tm * num_tiles_n + tn
+                bm = min(BLOCK_SIZE_M, M - tm * BLOCK_SIZE_M)
+                bn = min(BLOCK_SIZE_N, N - tn * BLOCK_SIZE_N)
+                x_desc = InputDependencyDesc(x, require_full=False, start_indices=(tm * BLOCK_SIZE_M, 0),
+                                             data_sizes=(bm, x.shape[1]))
+                rms_weight_desc = InputDependencyDesc(rms_weight, require_full=True)
+                w_desc = InputDependencyDesc(w, require_full=True)
+                y_desc = OutputTilingDesc(tile_sizes=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+                                          start_indices=(tm * BLOCK_SIZE_M, tn * BLOCK_SIZE_N))
+                inputs_dep = {x: x_desc, rms_weight: rms_weight_desc, w: w_desc}
+                outs_tile_mapping = {y: y_desc}
+                tasks.append(
+                    cls._create_task(layer_id, task_id, tile_id, num_tiles, kernel_config, dependency, io_tensors,
+                                     extra_params, inputs_dep, outs_tile_mapping))
+        return tasks
+
+    @classmethod
+    def build_tasks(cls, device_prop: 'DeviceProp', layer_id: int, dependency: TaskDependency,
+                    io_tensors: List[List['torch.Tensor']], extra_params: Dict[str, Any]) -> List[TaskBase]:
+        return cls._build_tasks_impl(device_prop, layer_id, dependency, io_tensors, extra_params)
+
+
 @registry.register_task(op_type="qkv_proj", task_cls=QKVProjTask, config_factory=linear_config_factory,
                         codegen_func=codegen_qkv_proj)
 class QKVProjTaskBuilder(LinearTaskBuilder):
@@ -336,7 +452,58 @@ class OProjTaskBuilder(LinearTaskBuilder):
             "BLOCK_SIZE_M": 16,
             "BLOCK_SIZE_N": 128,
             "BLOCK_SIZE_K": 64,
-            "NUM_STAGES": 7,
+            "NUM_STAGES": 5,
         }
         return cls._build_tasks_impl(device_prop, layer_id, dependency, io_tensors, extra_params, tile_wise=True,
                                      config_args=config_args)
+
+
+@registry.register_task(op_type="o_proj_add", task_cls=OProjAddTask, config_factory=o_proj_add_config_factory,
+                        codegen_func=codegen_o_proj_add)
+class OProjAddTaskBuilder(TaskBuilderBase):
+
+    @classmethod
+    def _build_tasks_impl(cls, device_prop, layer_id: int, dependency: TaskDependency, io_tensors, extra_params,
+                          config_args={}) -> List[TaskBase]:
+        kernel_config = cls.create_config(**config_args)
+        task_id = cls.get_task_id(layer_id)
+        BLOCK_SIZE_M = kernel_config.BLOCK_SIZE_M
+        BLOCK_SIZE_N = kernel_config.BLOCK_SIZE_N
+        x, w, residual = io_tensors[0]
+        y = io_tensors[1][0]
+        M, K = x.shape
+        N, wK = w.shape
+        assert K == wK
+        assert residual.shape == y.shape == (M, N)
+        num_tiles_m = cdiv(M, BLOCK_SIZE_M)
+        num_tiles_n = cdiv(N, BLOCK_SIZE_N)
+        num_tiles = num_tiles_m * num_tiles_n
+        tasks = []
+        cls.log(
+            f"OProjAdd Task: M = {M}, N = {N}, K = {K}, num_tiles = {num_tiles}, dependency = {dependency}, BLOCK_SIZE_M = {BLOCK_SIZE_M}, BLOCK_SIZE_N = {BLOCK_SIZE_N}"
+        )
+        for tm in range(num_tiles_m):
+            for tn in range(num_tiles_n):
+                tile_id = tm * num_tiles_n + tn
+                bm = min(BLOCK_SIZE_M, M - tm * BLOCK_SIZE_M)
+                bn = min(BLOCK_SIZE_N, N - tn * BLOCK_SIZE_N)
+                x_desc = InputDependencyDesc(x, require_full=False, start_indices=(tm * BLOCK_SIZE_M, 0),
+                                             data_sizes=(bm, K))
+                w_desc = InputDependencyDesc(w, require_full=False, start_indices=(tn * BLOCK_SIZE_N, 0),
+                                             data_sizes=(bn, K))
+                residual_desc = InputDependencyDesc(residual, require_full=False,
+                                                    start_indices=(tm * BLOCK_SIZE_M, tn * BLOCK_SIZE_N),
+                                                    data_sizes=(bm, bn))
+                y_desc = OutputTilingDesc(tile_sizes=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+                                          start_indices=(tm * BLOCK_SIZE_M, tn * BLOCK_SIZE_N))
+                inputs_dep = {x: x_desc, w: w_desc, residual: residual_desc}
+                outs_tile_mapping = {y: y_desc}
+                tasks.append(
+                    cls._create_task(layer_id, task_id, tile_id, num_tiles, kernel_config, dependency, io_tensors,
+                                     extra_params, inputs_dep, outs_tile_mapping))
+        return tasks
+
+    @classmethod
+    def build_tasks(cls, device_prop: 'DeviceProp', layer_id: int, dependency: TaskDependency,
+                    io_tensors: List[List['torch.Tensor']], extra_params: Dict[str, Any]) -> List[TaskBase]:
+        return cls._build_tasks_impl(device_prop, layer_id, dependency, io_tensors, extra_params)

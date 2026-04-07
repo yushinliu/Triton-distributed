@@ -42,6 +42,11 @@ class AllReduceTask(TaskBase):
     config: AllReduceConfig
 
 
+@dataclass
+class AllReduceNVSHMEMTask(TaskBase):
+    config: AllReduceConfig
+
+
 def allreduce_config_factory(**kwargs) -> AllReduceConfig:
     return dataclasses.replace(AllReduceConfig(), **kwargs)
 
@@ -51,6 +56,16 @@ def codegen_allreduce(task: AllReduceConfig) -> str:
 
     code = f"""
 allreduce_task_compute(task_base_info, scoreboard, BLOCK_SIZE={config.BLOCK_SIZE})
+"""
+    return code
+
+
+def codegen_allreduce_nvshmem(task: AllReduceNVSHMEMTask) -> str:
+    config: AllReduceConfig = task.config
+    gather_tensor = task.io_tensors[0][1]
+    num_local_pes = gather_tensor.numel() // (task.num_tiles * config.BLOCK_SIZE)
+    code = f"""
+allreduce_nvshmem_task_compute(task_base_info, scoreboard, BLOCK_SIZE={config.BLOCK_SIZE}, NUM_LOCAL_PES={num_local_pes})
 """
     return code
 
@@ -72,6 +87,33 @@ class AllReduceTaskBuilder(TaskBuilderBase):
 
         cls.log(
             f"AllReduce Task: num_tiles = {num_tiles}, num_elements = {num_elements}, BLOCK_SIZE = {kernel_config.BLOCK_SIZE}, dependency = {dependency}"
+        )
+        tasks = []
+        for i in range(num_tiles):
+            tasks.append(
+                cls._create_task(layer_id, task_id, i, num_tiles, kernel_config, dependency, io_tensors, extra_params))
+        return tasks
+
+
+@registry.register_task(op_type="allreduce_nvshmem", task_cls=AllReduceNVSHMEMTask,
+                        config_factory=allreduce_config_factory, codegen_func=codegen_allreduce_nvshmem)
+class AllReduceNVSHMEMTaskBuilder(TaskBuilderBase):
+
+    @classmethod
+    def _build_tasks_impl(cls, device_prop, layer_id: int, dependency: TaskDependency, io_tensors, extra_params,
+                          tile_wise=True) -> List[TaskBase]:
+        input, gather = io_tensors[0]
+        output = io_tensors[1][0]
+        num_elements = output.numel()
+        assert input.shape == output.shape and len(input.shape) == 1
+        task_id = cls.get_task_id(layer_id)
+        kernel_config = cls.create_config()
+        num_tiles = cdiv(num_elements, kernel_config.BLOCK_SIZE)
+        expected_gather_elems = num_tiles * kernel_config.BLOCK_SIZE
+        assert gather.numel() % expected_gather_elems == 0
+
+        cls.log(
+            f"AllReduceNVSHMEM Task: num_tiles = {num_tiles}, num_elements = {num_elements}, BLOCK_SIZE = {kernel_config.BLOCK_SIZE}, dependency = {dependency}"
         )
         tasks = []
         for i in range(num_tiles):

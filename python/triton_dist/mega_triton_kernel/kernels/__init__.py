@@ -22,21 +22,22 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
-from .mlp_fc1 import fc1_task_compute, mlp_fc1_silu_mul_up_task_compute
+from .mlp_fc1 import fc1_task_compute, mlp_fc1_silu_mul_up_task_compute, rms_norm_mlp_fc1_silu_mul_up_task_compute
 from .task_context import TaskBaseInfo
 from .activation import silu_mul_up_task_compute
 from .flash_decode import attn_gqa_fwd_batch_decode_combine_task_compute, attn_gqa_fwd_batch_decode_split_kv_task_compute
 from .flash_attn import qkv_pack_flash_attn_task_compute, flash_attn_task_compute
 from .norm import rmsnorm_rope_update_kv_cache_task_compute, rmsnorm_task_compute, qkv_pack_qk_norm_rope_split_v_task_compute
 from .elementwise import add_task_compute
-from .allreduce import allreduce_task_compute
+from .allreduce import allreduce_task_compute, allreduce_nvshmem_task_compute
 from .barrier import barrier_all_intra_node_task_compute
-from .linear import linear_task_compute
+from .linear import linear_task_compute, linear_add_task_compute
 from .prefetch import prefetch_task_compute
 
 __all__ = [
     "fc1_task_compute",
     "mlp_fc1_silu_mul_up_task_compute",
+    "rms_norm_mlp_fc1_silu_mul_up_task_compute",
     "TaskBaseInfo",
     "silu_mul_up_task_compute",
     "attn_gqa_fwd_batch_decode_combine_task_compute",
@@ -45,8 +46,10 @@ __all__ = [
     "rmsnorm_task_compute",
     "add_task_compute",
     "allreduce_task_compute",
+    "allreduce_nvshmem_task_compute",
     "barrier_all_intra_node_task_compute",
     "linear_task_compute",
+    "linear_add_task_compute",
     "prefetch_task_compute",
     "qkv_pack_flash_attn_task_compute",
     "flash_attn_task_compute",

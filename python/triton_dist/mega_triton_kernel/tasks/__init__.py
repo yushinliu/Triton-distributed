@@ -22,9 +22,10 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
-from .linear import LinearTaskBuilder, MLPFC1TaskBuilder, MLPFC1SiLUMulUpTaskBuilder, QKVProjTaskBuilder, OProjTaskBuilder
+from .linear import (LinearTaskBuilder, MLPFC1TaskBuilder, MLPFC1SiLUMulUpTaskBuilder,
+                     RMSNormMLPFC1SiLUMulUpTaskBuilder, QKVProjTaskBuilder, OProjTaskBuilder, OProjAddTaskBuilder)
 from .activation import SiLUMulUpTaskBuilder
-from .allreduce import AllReduceTaskBuilder
+from .allreduce import AllReduceTaskBuilder, AllReduceNVSHMEMTaskBuilder
 from .flash_decode import AttnSplitTaskBuilder, AttnCombineTaskBuilder
 from .norm import RMSNormTask, QKNormRopeUpdateKVCacheTaskBuilder, QKVPackQKNormRopeSplitVTaskBuilder
 from .elementwise import AddTaskBuilder
@@ -36,10 +37,13 @@ __all__ = [
     "LinearTaskBuilder",
     "MLPFC1TaskBuilder",
     "MLPFC1SiLUMulUpTaskBuilder",
+    "RMSNormMLPFC1SiLUMulUpTaskBuilder",
     "QKVProjTaskBuilder",
     "OProjTaskBuilder",
+    "OProjAddTaskBuilder",
     "SiLUMulUpTaskBuilder",
     "AllReduceTaskBuilder",
+    "AllReduceNVSHMEMTaskBuilder",
     "AttnSplitTaskBuilder",
     "AttnCombineTaskBuilder",
     "RMSNormTask",

@@ -244,6 +244,23 @@ class ModelBuilder:
         assert K % 32 == 0
         self._convert_op("mlp_fc1_silu_mul_up", layer_id, [[input, weight], [output]])
 
+    def make_fused_rms_norm_fc1_silu_mul_up(self, input: torch.Tensor, rms_weight: torch.Tensor, weight: torch.Tensor,
+                                            output: torch.Tensor, rms_eps: float = 1e-6, layer_id: int = 0):
+        check_tensor_dim(input, 2)
+        check_tensor_dim(rms_weight, 1)
+        check_tensor_dim(weight, 2)
+        check_tensor_dim(output, 2)
+        M, K = input.shape
+        N2, wK = weight.shape
+        oM, oN = output.shape
+        assert rms_weight.shape[0] == K
+        assert K == wK
+        assert N2 == oN * 2
+        assert oM == M
+        assert K % 32 == 0
+        self._convert_op("rms_norm_mlp_fc1_silu_mul_up", layer_id, [[input, rms_weight, weight], [output]],
+                         {"rms_eps": rms_eps})
+
     def make_fc2(self, input: torch.Tensor, weight: torch.Tensor, output: torch.Tensor, layer_id: int = 0):
         self._make_fc("mlp_fc2", input, weight, output, layer_id)
 
@@ -252,6 +269,22 @@ class ModelBuilder:
 
     def make_o_proj(self, input: torch.Tensor, weight: torch.Tensor, output: torch.Tensor, layer_id: int = 0):
         self._make_fc("o_proj", input, weight, output, layer_id)
+
+    def make_o_proj_add(self, input: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, output: torch.Tensor,
+                        layer_id: int = 0):
+        check_tensor_dim(input, 2)
+        check_tensor_dim(weight, 2)
+        check_tensor_dim(residual, 2)
+        check_tensor_dim(output, 2)
+        M, K = input.shape
+        N, wK = weight.shape
+        rM, rN = residual.shape
+        oM, oN = output.shape
+        assert K == wK
+        assert (rM, rN) == (M, N)
+        assert (oM, oN) == (M, N)
+        assert K % 32 == 0
+        self._convert_op("o_proj_add", layer_id, [[input, weight, residual], [output]])
 
     def make_linear(self, input: torch.Tensor, weight: torch.Tensor, output: torch.Tensor, layer_id: int = 0):
         check_tensor_dim(input, 2)
@@ -485,24 +518,37 @@ class ModelBuilder:
         self._convert_op("barrier_all_intra_node", layer_id,
                          [[self.barrier_all_intra_node_buf] + wait_inputs, wait_inputs], extra_params)
 
-    def make_allreduce(self, input: torch.Tensor, output: torch.Tensor, double_input_buffer=False, layer_id=0):
+    def make_allreduce(self, input: torch.Tensor, output: torch.Tensor, double_input_buffer=False, layer_id=0,
+                       implementation="multimem"):
         """
             if double_input_buffer is True, user needs to ensure that the input of two consecutive allreduce are completely different buffers,
             otherwise, the output may be wrong.
         """
         assert self.world_size > 1
-        if not is_multicast_ptr(input):
-            raise ValueError(
-                "The input tensor needs to be a symmetric buffer and AR is only supported in Hopper and later GPU architectures"
-            )
-        assert os.getenv("NVSHMEM_DISABLE_CUDA_VMM", "1") == "0"  # for multicast
         input = input.reshape(-1)
         output = output.reshape(-1)
         nbytes = input.numel() * input.element_size()
-        assert nbytes % 128 == 0
         assert input.shape == output.shape and input.dtype == output.dtype
+        if implementation == "multimem":
+            if not is_multicast_ptr(input):
+                raise ValueError(
+                    "The input tensor needs to be a symmetric buffer and AR is only supported in Hopper and later GPU architectures"
+                )
+            assert os.getenv("NVSHMEM_DISABLE_CUDA_VMM", "1") == "0"  # for multicast
+            assert nbytes % 128 == 0
+        elif implementation == "nvshmem":
+            builder_cls = self.get_task_builder("allreduce_nvshmem")
+            kernel_config = builder_cls.create_config()
+            num_tiles = (input.numel() + kernel_config.BLOCK_SIZE - 1) // kernel_config.BLOCK_SIZE
+            gather_buf = self.create_symm_tensor((num_tiles * self.local_world_size * kernel_config.BLOCK_SIZE, ),
+                                                 input.dtype)
+        else:
+            raise ValueError(f"Unsupported allreduce implementation: {implementation}")
         self.make_barrier_all_intra_node(wait_inputs=[input], layer_id=layer_id)
-        self._convert_op("allreduce", layer_id, [[input], [output]])
+        if implementation == "multimem":
+            self._convert_op("allreduce", layer_id, [[input], [output]])
+        else:
+            self._convert_op("allreduce_nvshmem", layer_id, [[input, gather_buf], [output]])
         if not double_input_buffer:
             self.make_barrier_all_intra_node(wait_inputs=[output], layer_id=layer_id)
 

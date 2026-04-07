@@ -63,3 +63,54 @@ def allreduce_task_compute(
     num_pid = tl.cdiv(n_elements, BLOCK_SIZE)
     allreduce_one_shot_multimem_intra_node_kernel(tile_id, num_pid, input_ptr, output_ptr, n_elements)
     scoreboard.release_tile(task_base_info, task_base_info.tile_id_or_start)
+
+
+@triton_dist.jit
+def allreduce_one_shot_nvshmem_fcollect_intra_node_kernel(pid, symm_in_ptr, symm_gather_ptr, out_ptr, elems,
+                                                          BLOCK_SIZE: tl.constexpr, NUM_LOCAL_PES: tl.constexpr):
+    symm_in_ptr = tl.cast(symm_in_ptr, out_ptr.dtype)
+    symm_gather_ptr = tl.cast(symm_gather_ptr, out_ptr.dtype)
+
+    tile_start = pid * BLOCK_SIZE
+    if tile_start >= elems:
+        return
+
+    valid_elems = tl.minimum(BLOCK_SIZE, elems - tile_start)
+    input_tile_ptr = symm_in_ptr + tile_start
+    gather_tile_ptr = symm_gather_ptr + pid * BLOCK_SIZE * NUM_LOCAL_PES
+
+    libshmem_device.fcollect_block(libshmem_device.NVSHMEMX_TEAM_NODE, gather_tile_ptr, input_tile_ptr, valid_elems)
+    __syncthreads()
+
+    thread_idx = tid(axis=0)
+    block_dim = num_warps() * 32
+    for off in range(0, BLOCK_SIZE, block_dim):
+        idx = thread_idx + off
+        if idx < valid_elems:
+            acc = tl.zeros((), dtype=tl.float32)
+            for pe in tl.static_range(0, NUM_LOCAL_PES):
+                acc += tl.load(gather_tile_ptr + pe * valid_elems + idx).to(tl.float32)
+            tl.store(out_ptr + tile_start + idx, acc.to(out_ptr.dtype.element_ty))
+    __syncthreads()
+
+
+@triton_dist.jit
+def allreduce_nvshmem_task_compute(
+    task_base_info: TaskBaseInfo,
+    scoreboard: Scoreboard,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_LOCAL_PES: tl.constexpr,
+):
+    input_tensor = task_base_info.get_tensor(0)
+    gather_tensor = task_base_info.get_tensor(1)
+    output_tensor = task_base_info.get_tensor(2)
+
+    input_ptr = input_tensor.data_ptr(tl.bfloat16)
+    gather_ptr = gather_tensor.data_ptr(tl.bfloat16)
+    output_ptr = output_tensor.data_ptr(tl.bfloat16)
+
+    n_elements = output_tensor.size(0)
+    tile_id = task_base_info.tile_id_or_start
+    allreduce_one_shot_nvshmem_fcollect_intra_node_kernel(tile_id, input_ptr, gather_ptr, output_ptr, n_elements,
+                                                          BLOCK_SIZE, NUM_LOCAL_PES)
+    scoreboard.release_tile(task_base_info, task_base_info.tile_id_or_start)

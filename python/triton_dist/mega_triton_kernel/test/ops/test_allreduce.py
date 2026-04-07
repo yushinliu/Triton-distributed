@@ -39,6 +39,7 @@ from triton_dist.utils import (
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", default=False, action="store_true", help="enable profiling")
+    parser.add_argument("--allreduce_impl", type=str, default="multimem", choices=["multimem", "nvshmem"])
     return parser.parse_args()
 
 
@@ -65,7 +66,7 @@ if __name__ == "__main__":
     out = torch.zeros((batch * seq_len, hidden_size), dtype=dtype, device=torch.cuda.current_device())
     gemm_weight = torch.rand((intermidiate_size, hidden_size), dtype=dtype, device=torch.cuda.current_device())
     gemm_out = torch.empty((batch * seq_len, gemm_weight.shape[0]), dtype=dtype, device=torch.cuda.current_device())
-    builder.make_allreduce(x, out, double_input_buffer=True)
+    builder.make_allreduce(x, out, double_input_buffer=True, implementation=args.allreduce_impl)
     builder.make_linear(out, gemm_weight, gemm_out)
 
     builder.compile()
