@@ -24,7 +24,7 @@
 ################################################################################
 import torch
 from typing import Any, Dict, List
-from .utils import cdiv
+from .utils import TASK_COMPUTE_ARGS, cdiv
 import dataclasses
 from dataclasses import dataclass
 from ..core.task_base import TaskBase, TaskDependency, InputDependencyDesc, OutputTilingDesc, DeviceProp
@@ -176,7 +176,7 @@ def codegen_linear(task: LinearTask) -> str:
     if K % 16 == 0:
         ALIGNMENT_K = 16
     code = f"""
-linear_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
+linear_task_compute({TASK_COMPUTE_ARGS}, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
                 BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES}, ALIGNMENT_K={ALIGNMENT_K})
 """
     return code
@@ -185,7 +185,7 @@ linear_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_
 def codegen_mlp_fc1(task: MLPFC1Task) -> str:
     config: MLPFC1Config = task.config
     code = f"""
-fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
+fc1_task_compute({TASK_COMPUTE_ARGS}, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
                 BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES})
 """
     return code
@@ -194,7 +194,7 @@ fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
 def codegen_mlp_fc2(task: MLPFC2Task) -> str:
     config: MLPFC2Config = task.config
     code = f"""
-fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
+fc1_task_compute({TASK_COMPUTE_ARGS}, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
                 BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES})
 """
     return code
@@ -203,7 +203,7 @@ fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
 def codegen_mlp_fc1_silu_mul_up(task: MLPFC1SiLUMulUpTask) -> str:
     config: MLPFC1SiLUMulUpConfig = task.config
     code = f"""
-mlp_fc1_silu_mul_up_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
+mlp_fc1_silu_mul_up_task_compute({TASK_COMPUTE_ARGS}, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
                 BLOCK_SIZE_N={config.BLOCK_SIZE_N}, BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES})
 """
     return code
@@ -212,7 +212,7 @@ mlp_fc1_silu_mul_up_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={confi
 def codegen_rms_norm_mlp_fc1_silu_mul_up(task: RMSNormMLPFC1SiLUMulUpTask) -> str:
     config: RMSNormMLPFC1SiLUMulUpConfig = task.config
     code = f"""
-rms_norm_mlp_fc1_silu_mul_up_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
+rms_norm_mlp_fc1_silu_mul_up_task_compute({TASK_COMPUTE_ARGS}, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
                 BLOCK_SIZE_N={config.BLOCK_SIZE_N}, BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES},
                 RMS_EPS={task.extra_params["rms_eps"]})
 """
@@ -222,7 +222,7 @@ rms_norm_mlp_fc1_silu_mul_up_task_compute(task_base_info, scoreboard, BLOCK_SIZE
 def codegen_qkv_proj(task: QKVProjTask) -> str:
     config: LinearConfig = task.config
     code = f"""
-fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
+fc1_task_compute({TASK_COMPUTE_ARGS}, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
                 BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES})
 """
     return code
@@ -231,7 +231,7 @@ fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
 def codegen_o_proj(task: OProjTask) -> str:
     config: LinearConfig = task.config
     code = f"""
-fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
+fc1_task_compute({TASK_COMPUTE_ARGS}, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
                 BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES})
 """
     return code
@@ -240,7 +240,7 @@ fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
 def codegen_o_proj_add(task: OProjAddTask) -> str:
     config: OProjAddConfig = task.config
     code = f"""
-linear_add_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
+linear_add_task_compute({TASK_COMPUTE_ARGS}, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N},
                 BLOCK_SIZE_K={config.BLOCK_SIZE_K}, NUM_STAGES={config.NUM_STAGES}, ALIGNMENT_K=16)
 """
     return code

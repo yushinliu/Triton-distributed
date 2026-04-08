@@ -25,6 +25,7 @@
 import triton
 import triton.language as tl
 from triton.language import core
+from .task_context import get_tensor_data_ptr, get_tensor_size
 
 
 @core.extern
@@ -44,13 +45,14 @@ def prefetch_async(ptr, nbytes, _semantic=None):
 
 
 @triton.jit
-def prefetch_task_compute(task_base_info, scoreboard):
-    weight_tensor = task_base_info.get_tensor(0)
-    weight_ptr = weight_tensor.data_ptr(tl.bfloat16)
-    M = weight_tensor.size(0)
-    N = weight_tensor.size(1, 32)
+def prefetch_task_compute(io_tensors_ptr, layer_id, task_id, tile_id_or_start, scoreboard_ptr,
+                          MAX_TASK_ID: tl.constexpr, MAX_NUM_TILES_PER_OP: tl.constexpr,
+                          MAX_NUM_TENSOR_DIMS: tl.constexpr):
+    weight_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    M = get_tensor_size(io_tensors_ptr, 0, 0, MAX_NUM_TENSOR_DIMS)
+    N = get_tensor_size(io_tensors_ptr, 0, 1, MAX_NUM_TENSOR_DIMS, 32)
 
     elem_size = tl.constexpr(weight_ptr.dtype.element_ty.primitive_bitwidth) // 8
     nbytes = elem_size * M * N
-    if task_base_info.tile_id_or_start == 0:
+    if tile_id_or_start == 0:
         prefetch_async(weight_ptr, nbytes)

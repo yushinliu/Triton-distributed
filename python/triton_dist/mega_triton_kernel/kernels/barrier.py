@@ -26,7 +26,7 @@ import triton
 import triton.language as tl
 from triton_dist.language.extra.language_extra import tid, __syncthreads, atomic_cas
 import triton_dist.language as dl
-from .task_context import TaskBaseInfo, Scoreboard
+from .task_context import get_extra_params_ptr, get_tensor_data_ptr, release_tile
 
 
 @triton.jit
@@ -48,14 +48,19 @@ def barrier_all_intra_node_atomic_cas_block(local_rank, local_world_size, symm_f
 
 @triton.jit
 def barrier_all_intra_node_task_compute(
-    task_base_info: TaskBaseInfo,
-    scoreboard: Scoreboard,
+    io_tensors_ptr,
+    layer_id,
+    task_id,
+    tile_id_or_start,
+    scoreboard_ptr,
+    MAX_TASK_ID: tl.constexpr,
+    MAX_NUM_TILES_PER_OP: tl.constexpr,
+    MAX_NUM_TENSOR_DIMS: tl.constexpr,
 ):
-    symm_flag_tensor = task_base_info.get_tensor(0)
-    symm_flag_ptr = symm_flag_tensor.data_ptr(tl.int32)
-    extra_params_ptr = task_base_info.get_extra_params_ptr(1)
+    symm_flag_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, tl.int32, MAX_NUM_TENSOR_DIMS)
+    extra_params_ptr = get_extra_params_ptr(io_tensors_ptr, 1, MAX_NUM_TENSOR_DIMS)
 
     local_rank = tl.load(extra_params_ptr + 0).to(tl.int32)
     local_world_size = tl.load(extra_params_ptr + 1).to(tl.int32)
     barrier_all_intra_node_atomic_cas_block(local_rank, local_world_size, symm_flag_ptr)
-    scoreboard.release_tile(task_base_info, 0)
+    release_tile(scoreboard_ptr, layer_id, task_id, 0, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)

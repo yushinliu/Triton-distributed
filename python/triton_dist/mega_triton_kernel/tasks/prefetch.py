@@ -25,6 +25,7 @@
 from typing import Tuple, List
 import dataclasses
 from dataclasses import dataclass
+from .utils import TASK_COMPUTE_ARGS
 from ..core.task_base import TaskBase, TaskDependency
 from ..core.builder import TaskBuilderBase
 from ..core.registry import registry
@@ -49,8 +50,8 @@ def prefetch_config_factory(**kwargs) -> PrefetchConfig:
 
 
 def codegen_prefetch(task: PrefetchConfig) -> str:
-    code = """
-prefetch_task_compute(task_base_info, scoreboard)
+    code = f"""
+prefetch_task_compute({TASK_COMPUTE_ARGS})
 """
     return code
 

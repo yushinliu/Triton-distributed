@@ -23,7 +23,7 @@
 #
 ################################################################################
 from typing import List
-from .utils import cdiv, build_tile_desc
+from .utils import TASK_COMPUTE_ARGS, cdiv, build_tile_desc
 import dataclasses
 from dataclasses import dataclass
 from ..core.task_base import TaskBase, TaskDependency, InputDependencyDesc, OutputTilingDesc
@@ -55,7 +55,7 @@ def codegen_add(task: ElementwiseConfig) -> str:
     config: ElementwiseConfig = task.config
 
     code = f"""
-add_task_compute(task_base_info, scoreboard, BLOCK_SIZE={config.BLOCK_SIZE})
+add_task_compute({TASK_COMPUTE_ARGS}, BLOCK_SIZE={config.BLOCK_SIZE})
 """
     return code
 

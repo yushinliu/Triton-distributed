@@ -24,7 +24,7 @@
 ################################################################################
 import math
 from typing import Tuple, List
-from .utils import cdiv
+from .utils import TASK_COMPUTE_ARGS, cdiv
 import triton
 import dataclasses
 from dataclasses import dataclass
@@ -76,7 +76,7 @@ def codegen_attn_split(task: AttnSplitTask) -> str:
 
     code = f"""
 attn_gqa_fwd_batch_decode_split_kv_task_compute(
-    task_base_info, scoreboard, SM_SCALE={task.extra_params["sm_scale"]}, SOFT_CAP={task.extra_params["soft_cap"]},
+    {TASK_COMPUTE_ARGS}, SM_SCALE={task.extra_params["sm_scale"]}, SOFT_CAP={task.extra_params["soft_cap"]},
     NUM_Q_HEADS={NUM_Q_HEADS}, NUM_KV_HEADS={NUM_KV_HEADS}, Q_HEAD_DIM={Q_HEAD_DIM}, V_HEAD_DIM={V_HEAD_DIM}, PAGE_SIZE={PAGE_SIZE},
     MAX_NUM_BLOCKS_PER_SEQ={MAX_NUM_BLOCKS_PER_SEQ}, BLOCK_N={config.BLOCK_N}, BLOCK_HEAD_DIM={config.BLOCK_HEAD_DIM},
     BLOCK_DPE={config.BLOCK_DPE}, BLOCK_DV={config.BLOCK_DV}, BLOCK_H={config.BLOCK_H}, NUM_KV_SPLITS={config.NUM_KV_SPLITS}
@@ -92,7 +92,7 @@ def codegen_attn_combine(task: AttnSplitTask) -> str:
     NUM_Q_HEADS, V_HEAD_DIM = output.shape[-2], output.shape[-1]
     code = f"""
 attn_gqa_fwd_batch_decode_combine_task_compute(
-    task_base_info, scoreboard, NUM_Q_HEADS={NUM_Q_HEADS}, V_HEAD_DIM={V_HEAD_DIM}, BLOCK_DV={config.BLOCK_DV}, NUM_KV_SPLITS={config.NUM_KV_SPLITS}
+    {TASK_COMPUTE_ARGS}, NUM_Q_HEADS={NUM_Q_HEADS}, V_HEAD_DIM={V_HEAD_DIM}, BLOCK_DV={config.BLOCK_DV}, NUM_KV_SPLITS={config.NUM_KV_SPLITS}
 )
 """
     return code

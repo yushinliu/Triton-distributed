@@ -25,6 +25,7 @@
 from typing import Tuple, List
 import dataclasses
 from dataclasses import dataclass
+from .utils import TASK_COMPUTE_ARGS
 from ..core.task_base import TaskBase, TaskDependency, MAX_NUM_TENSOR_DIMS
 from ..core.builder import TaskBuilderBase
 from ..core.registry import registry
@@ -69,8 +70,8 @@ def barrier_all_intra_node_config_factory(**kwargs) -> BarrierAllIntraNodeConfig
 
 
 def codegen_barrier_all_intra_node(task: BarrierAllIntraNodeConfig) -> str:
-    code = """
-barrier_all_intra_node_task_compute(task_base_info, scoreboard)
+    code = f"""
+barrier_all_intra_node_task_compute({TASK_COMPUTE_ARGS})
 """
     return code
 

@@ -25,7 +25,7 @@
 import triton.language as tl
 import triton_dist
 from triton_dist.language.extra.language_extra import tid, __syncthreads
-from .task_context import TaskBaseInfo, Scoreboard
+from .task_context import get_tensor_data_ptr, get_tensor_size, release_tile
 from triton_dist.language.extra import libshmem_device
 from triton_dist.language.extra.cuda.language_extra import (st_v4_b32, multimem_ld_reduce_v4)
 from triton.language.extra.cuda.utils import num_warps
@@ -48,21 +48,24 @@ def allreduce_one_shot_multimem_intra_node_kernel(pid, num_pid, symm_in_ptr, out
 
 @triton_dist.jit
 def allreduce_task_compute(
-    task_base_info: TaskBaseInfo,
-    scoreboard: Scoreboard,
+    io_tensors_ptr,
+    layer_id,
+    task_id,
+    tile_id_or_start,
+    scoreboard_ptr,
+    MAX_TASK_ID: tl.constexpr,
+    MAX_NUM_TILES_PER_OP: tl.constexpr,
+    MAX_NUM_TENSOR_DIMS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    input_tensor = task_base_info.get_tensor(0)
-    output_tensor = task_base_info.get_tensor(1)
+    input_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    output_ptr = get_tensor_data_ptr(io_tensors_ptr, 1, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
 
-    input_ptr = input_tensor.data_ptr(tl.bfloat16)
-    output_ptr = output_tensor.data_ptr(tl.bfloat16)
-
-    n_elements = output_tensor.size(0)
-    tile_id = task_base_info.tile_id_or_start
+    n_elements = get_tensor_size(io_tensors_ptr, 1, 0, MAX_NUM_TENSOR_DIMS)
+    tile_id = tile_id_or_start
     num_pid = tl.cdiv(n_elements, BLOCK_SIZE)
     allreduce_one_shot_multimem_intra_node_kernel(tile_id, num_pid, input_ptr, output_ptr, n_elements)
-    scoreboard.release_tile(task_base_info, task_base_info.tile_id_or_start)
+    release_tile(scoreboard_ptr, layer_id, task_id, tile_id, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)
 
 
 @triton_dist.jit
@@ -115,21 +118,23 @@ def allreduce_one_shot_nvshmem_remote_write_intra_node_kernel(pid, symm_in_ptr, 
 
 @triton_dist.jit
 def allreduce_nvshmem_task_compute(
-    task_base_info: TaskBaseInfo,
-    scoreboard: Scoreboard,
+    io_tensors_ptr,
+    layer_id,
+    task_id,
+    tile_id_or_start,
+    scoreboard_ptr,
+    MAX_TASK_ID: tl.constexpr,
+    MAX_NUM_TILES_PER_OP: tl.constexpr,
+    MAX_NUM_TENSOR_DIMS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_LOCAL_PES: tl.constexpr,
 ):
-    input_tensor = task_base_info.get_tensor(0)
-    scratch_tensor = task_base_info.get_tensor(1)
-    output_tensor = task_base_info.get_tensor(2)
+    input_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    scratch_ptr = get_tensor_data_ptr(io_tensors_ptr, 1, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    output_ptr = get_tensor_data_ptr(io_tensors_ptr, 2, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
 
-    input_ptr = input_tensor.data_ptr(tl.bfloat16)
-    scratch_ptr = scratch_tensor.data_ptr(tl.bfloat16)
-    output_ptr = output_tensor.data_ptr(tl.bfloat16)
-
-    n_elements = output_tensor.size(0)
-    tile_id = task_base_info.tile_id_or_start
+    n_elements = get_tensor_size(io_tensors_ptr, 2, 0, MAX_NUM_TENSOR_DIMS)
+    tile_id = tile_id_or_start
     allreduce_one_shot_nvshmem_remote_write_intra_node_kernel(tile_id, input_ptr, scratch_ptr, output_ptr, n_elements,
                                                               BLOCK_SIZE, NUM_LOCAL_PES)
-    scoreboard.release_tile(task_base_info, task_base_info.tile_id_or_start)
+    release_tile(scoreboard_ptr, layer_id, task_id, tile_id, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)

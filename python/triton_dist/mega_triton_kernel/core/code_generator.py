@@ -58,8 +58,7 @@ import triton
 import triton_dist
 import triton.language as tl
 from triton_dist.mega_triton_kernel.kernels import *
-
-from triton_dist.mega_triton_kernel.kernels.task_context import Scoreboard
+from triton_dist.mega_triton_kernel.kernels.task_context import wait_deps
 from triton_dist.tools.profiler import Profiler
 from triton_dist.language.extra.language_extra import tid
 
@@ -92,9 +91,8 @@ def FETCH_TASK(work_queues, idx, INT_PER_TASK, NUM_SMS, MAX_NUM_TENSOR_DIMS, ENA
         depend_entry_start = tl.load(work_queues + idx * INT_PER_TASK + DEPEND_ENTRY_START_OFFSET).to(tl.int32)
         depend_entry_end = tl.load(work_queues + idx * INT_PER_TASK + DEPEND_ENTRY_END_OFFSET).to(tl.int32)
         io_tensors_ptr = work_queues + idx * INT_PER_TASK + IO_TENSORS_OFFSET
-    
-    task_base_info = TaskBaseInfo(io_tensors_ptr, task_type, layer_id, task_id, tile_id_or_start, depend_entry_start, depend_entry_end, MAX_NUM_TENSOR_DIMS)
-    return task_base_info
+
+    return task_type, layer_id, task_id, tile_id_or_start, depend_entry_start, depend_entry_end, io_tensors_ptr
 
 
 @triton_dist.jit
@@ -116,9 +114,6 @@ def MEGA_TRITON_KERNEL(
 ):
     {f"profiler = Profiler.create(profiler_buf, 0, is_leader=(tid(0) == 0), ENABLE_PROFILING={enable_profiling})" if enable_profiling else ""}
 
-    WARP_SIZE: tl.constexpr = 32
-    NUM_THREADS: tl.constexpr = num_warps * WARP_SIZE
-    scoreboard = Scoreboard(task_deps_ptr, INT_PER_DEPS, scoreboard_ptr, MAX_TASK_ID, MAX_NUM_TILES_PER_OP, tl.constexpr(1), NUM_THREADS)
     sm_id = tl.program_id(axis=0)
 
     {(
@@ -136,8 +131,16 @@ def MEGA_TRITON_KERNEL(
     if cur_task_idx >= num_tasks:
         return
 
-    cur_task_base_info = FETCH_TASK(work_queues, cur_task_idx, INT_PER_TASK, NUM_SMS, MAX_NUM_TENSOR_DIMS, ENABLE_RUNTIME_SCHEDUER={enable_runtime_scheduler})
-    nxt_task_base_info = cur_task_base_info
+    cur_task_type, cur_layer_id, cur_task_id, cur_tile_id_or_start, cur_depend_entry_start, cur_depend_entry_end, cur_io_tensors_ptr = FETCH_TASK(
+        work_queues, cur_task_idx, INT_PER_TASK, NUM_SMS, MAX_NUM_TENSOR_DIMS, ENABLE_RUNTIME_SCHEDUER={enable_runtime_scheduler}
+    )
+    nxt_task_type = cur_task_type
+    nxt_layer_id = cur_layer_id
+    nxt_task_id = cur_task_id
+    nxt_tile_id_or_start = cur_tile_id_or_start
+    nxt_depend_entry_start = cur_depend_entry_start
+    nxt_depend_entry_end = cur_depend_entry_end
+    nxt_io_tensors_ptr = cur_io_tensors_ptr
     nxt_task_idx = cur_task_idx
 
     while cur_task_idx < num_tasks:
@@ -146,19 +149,32 @@ def MEGA_TRITON_KERNEL(
         f'''
         {'nxt_task_idx = tl.atomic_add(work_queue_start, 1, scope="gpu", sem="release")' if enable_runtime_scheduler else 'nxt_task_idx = cur_task_idx + 1'}
         if nxt_task_idx < num_tasks:
-            nxt_task_base_info = FETCH_TASK(work_queues, nxt_task_idx, INT_PER_TASK, NUM_SMS, MAX_NUM_TENSOR_DIMS, ENABLE_RUNTIME_SCHEDUER={enable_runtime_scheduler})
+            nxt_task_type, nxt_layer_id, nxt_task_id, nxt_tile_id_or_start, nxt_depend_entry_start, nxt_depend_entry_end, nxt_io_tensors_ptr = FETCH_TASK(
+                work_queues, nxt_task_idx, INT_PER_TASK, NUM_SMS, MAX_NUM_TENSOR_DIMS, ENABLE_RUNTIME_SCHEDUER={enable_runtime_scheduler}
+            )
         ''' if enalbe_task_prefetch else ''
         )}
 
-        task_type = cur_task_base_info.task_type
+        task_type = cur_task_type
+        layer_id = cur_layer_id
+        task_id = cur_task_id
+        tile_id_or_start = cur_tile_id_or_start
+        depend_entry_start = cur_depend_entry_start
+        depend_entry_end = cur_depend_entry_end
+        io_tensors_ptr = cur_io_tensors_ptr
 
         # task kernel need to set signal for each tile
         {f"profiler = profiler.record(is_start=True, task_type={scoreboard_wait_deps_task_type})" if enable_profiling else ""}
-        scoreboard.wait_deps(cur_task_base_info)
+        wait_deps(
+            task_deps_ptr,
+            INT_PER_DEPS,
+            scoreboard_ptr,
+            depend_entry_start,
+            depend_entry_end,
+        )
         {f"profiler = profiler.record(is_start=False, task_type={scoreboard_wait_deps_task_type})" if enable_profiling else ""}
 
         #### run task ####
-        task_base_info = cur_task_base_info
         {"profiler = profiler.record(is_start=True, task_type=task_type)" if enable_profiling else ""}
 {textwrap.indent(tasks_dispatch_code.strip(), '        ')}
         {"profiler = profiler.record(is_start=False, task_type=task_type)" if enable_profiling else ""}
@@ -168,10 +184,18 @@ def MEGA_TRITON_KERNEL(
         f'''
         {'cur_task_idx = tl.atomic_add(work_queue_start, 1, scope="gpu", sem="release")' if enable_runtime_scheduler else 'cur_task_idx = cur_task_idx + 1'}
         if cur_task_idx < num_tasks:
-            cur_task_base_info = FETCH_TASK(work_queues, cur_task_idx, INT_PER_TASK, NUM_SMS, MAX_NUM_TENSOR_DIMS, ENABLE_RUNTIME_SCHEDUER={enable_runtime_scheduler})
+            cur_task_type, cur_layer_id, cur_task_id, cur_tile_id_or_start, cur_depend_entry_start, cur_depend_entry_end, cur_io_tensors_ptr = FETCH_TASK(
+                work_queues, cur_task_idx, INT_PER_TASK, NUM_SMS, MAX_NUM_TENSOR_DIMS, ENABLE_RUNTIME_SCHEDUER={enable_runtime_scheduler}
+            )
         ''' if not enalbe_task_prefetch else
         '''
-        cur_task_base_info = nxt_task_base_info
+        cur_task_type = nxt_task_type
+        cur_layer_id = nxt_layer_id
+        cur_task_id = nxt_task_id
+        cur_tile_id_or_start = nxt_tile_id_or_start
+        cur_depend_entry_start = nxt_depend_entry_start
+        cur_depend_entry_end = nxt_depend_entry_end
+        cur_io_tensors_ptr = nxt_io_tensors_ptr
         cur_task_idx = nxt_task_idx
         '''
         )}
@@ -184,8 +208,8 @@ class CodeGenerator:
     def __init__(self):
         self._condition_and_codes: Dict[int, List[Tuple[CodeGenKey, str]]] = {}
         self._variable_names: Dict[str, str] = {
-            "layer_id": "task_base_info.layer_id",
-            "task_id": "task_base_info.task_id",
+            "layer_id": "layer_id",
+            "task_id": "task_id",
             "task_type": "task_type",
         }
         self._task_types_and_str: Dict[int, str] = {}

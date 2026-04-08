@@ -25,14 +25,20 @@
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
-from .task_context import TaskBaseInfo, Scoreboard
+from .task_context import get_tensor_data_ptr, release_tile
 from .utils import tanh
 
 
 @triton.jit
 def attn_gqa_fwd_batch_decode_split_kv_task_compute(
-    task_base_info: TaskBaseInfo,
-    scoreboard: Scoreboard,
+    io_tensors_ptr,
+    layer_id,
+    task_id,
+    tile_id_or_start,
+    scoreboard_ptr,
+    MAX_TASK_ID: tl.constexpr,
+    MAX_NUM_TILES_PER_OP: tl.constexpr,
+    MAX_NUM_TENSOR_DIMS: tl.constexpr,
     SM_SCALE: tl.constexpr,
     SOFT_CAP: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
@@ -48,14 +54,14 @@ def attn_gqa_fwd_batch_decode_split_kv_task_compute(
     BLOCK_H: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
 ):
-    tile_id = task_base_info.tile_id_or_start
-    q_ptr = task_base_info.get_tensor(0).data_ptr(tl.bfloat16)
-    k_cache_ptr = task_base_info.get_tensor(1).data_ptr(tl.bfloat16)
-    v_cache_ptr = task_base_info.get_tensor(2).data_ptr(tl.bfloat16)
-    block_table_ptr = task_base_info.get_tensor(3).data_ptr(tl.int32)
-    kv_length_ptr = task_base_info.get_tensor(4).data_ptr(tl.int32)
-    partial_out_ptr = task_base_info.get_tensor(5).data_ptr(tl.float32)
-    lse_ptr = task_base_info.get_tensor(6).data_ptr(tl.float32)
+    tile_id = tile_id_or_start
+    q_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    k_cache_ptr = get_tensor_data_ptr(io_tensors_ptr, 1, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    v_cache_ptr = get_tensor_data_ptr(io_tensors_ptr, 2, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    block_table_ptr = get_tensor_data_ptr(io_tensors_ptr, 3, tl.int32, MAX_NUM_TENSOR_DIMS)
+    kv_length_ptr = get_tensor_data_ptr(io_tensors_ptr, 4, tl.int32, MAX_NUM_TENSOR_DIMS)
+    partial_out_ptr = get_tensor_data_ptr(io_tensors_ptr, 5, tl.float32, MAX_NUM_TENSOR_DIMS)
+    lse_ptr = get_tensor_data_ptr(io_tensors_ptr, 6, tl.float32, MAX_NUM_TENSOR_DIMS)
 
     tl.static_assert(NUM_Q_HEADS % NUM_KV_HEADS == 0)
     NUM_Q_HEADS_PER_GROUP: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
@@ -159,24 +165,30 @@ def attn_gqa_fwd_batch_decode_split_kv_task_compute(
     offs_log = bid * stride_lse_bs + cur_head * stride_lse_h + split_kv_id
     tl.store(lse_ptr + offs_log, e_max + tl.log(e_sum), mask=mask_h)
 
-    scoreboard.release_tile(task_base_info, tile_id)
+    release_tile(scoreboard_ptr, layer_id, task_id, tile_id, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)
 
 
 @triton.jit
 def attn_gqa_fwd_batch_decode_combine_task_compute(
-    task_base_info: TaskBaseInfo,
-    scoreboard: Scoreboard,
+    io_tensors_ptr,
+    layer_id,
+    task_id,
+    tile_id_or_start,
+    scoreboard_ptr,
+    MAX_TASK_ID: tl.constexpr,
+    MAX_NUM_TILES_PER_OP: tl.constexpr,
+    MAX_NUM_TENSOR_DIMS: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     V_HEAD_DIM: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr,
 ):
-    tile_id = task_base_info.tile_id_or_start
+    tile_id = tile_id_or_start
 
-    kv_length_ptr = task_base_info.get_tensor(0).data_ptr(tl.int32)
-    partial_out_ptr = task_base_info.get_tensor(1).data_ptr(tl.float32)
-    lse_ptr = task_base_info.get_tensor(2).data_ptr(tl.float32)
-    out_ptr = task_base_info.get_tensor(3).data_ptr(tl.bfloat16)
+    kv_length_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, tl.int32, MAX_NUM_TENSOR_DIMS)
+    partial_out_ptr = get_tensor_data_ptr(io_tensors_ptr, 1, tl.float32, MAX_NUM_TENSOR_DIMS)
+    lse_ptr = get_tensor_data_ptr(io_tensors_ptr, 2, tl.float32, MAX_NUM_TENSOR_DIMS)
+    out_ptr = get_tensor_data_ptr(io_tensors_ptr, 3, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
 
     # partial out stride
     stride_o_bs: tl.constexpr = NUM_Q_HEADS * NUM_KV_SPLITS * V_HEAD_DIM
@@ -229,4 +241,4 @@ def attn_gqa_fwd_batch_decode_combine_task_compute(
         mask=mask_d,
     )
 
-    scoreboard.release_tile(task_base_info, tile_id)
+    release_tile(scoreboard_ptr, layer_id, task_id, tile_id, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)

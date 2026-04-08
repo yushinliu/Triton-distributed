@@ -24,14 +24,20 @@
 ################################################################################
 import triton
 import triton.language as tl
-from .task_context import TaskBaseInfo, Scoreboard, TensorDesc
+from .task_context import get_tensor_data_ptr, get_tensor_size, release_tile
 from .utils import next_power_of_2
 
 
 @triton.jit
 def rmsnorm_rope_update_kv_cache_task_compute(
-    task_base_info: TaskBaseInfo,
-    scoreboard: Scoreboard,
+    io_tensors_ptr,
+    layer_id,
+    task_id,
+    tile_id_or_start,
+    scoreboard_ptr,
+    MAX_TASK_ID: tl.constexpr,
+    MAX_NUM_TILES_PER_OP: tl.constexpr,
+    MAX_NUM_TENSOR_DIMS: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     Q_HEAD_DIM: tl.constexpr,
@@ -47,35 +53,22 @@ def rmsnorm_rope_update_kv_cache_task_compute(
     # qkv : [batch, seq_len, num_total_heads, q_head_dim]
     # rms_weight: [q_head_dim]
     # assume that q_head_dim == v_head_dim
+    tile_id = tile_id_or_start
 
-    qkv_tensor: TensorDesc = task_base_info.get_tensor(0)
-    block_tables_tensor: TensorDesc = task_base_info.get_tensor(1)
-    kv_lens_tensor: TensorDesc = task_base_info.get_tensor(2)
-    q_rms_weight_tensor: TensorDesc = task_base_info.get_tensor(3)
-    k_rms_weight_tensor: TensorDesc = task_base_info.get_tensor(4)
-    cos_cache_tensor: TensorDesc = task_base_info.get_tensor(5)
-    sin_cache_tensor: TensorDesc = task_base_info.get_tensor(6)
-    k_cache_tensor: TensorDesc = task_base_info.get_tensor(7)
-    v_cache_tensor: TensorDesc = task_base_info.get_tensor(8)
-    q_norm_rope_tensor: TensorDesc = task_base_info.get_tensor(9)
+    k_cache_ptr = get_tensor_data_ptr(io_tensors_ptr, 7, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    v_cache_ptr = get_tensor_data_ptr(io_tensors_ptr, 8, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
 
-    # num tiles of qkv
-    tile_id = task_base_info.tile_id_or_start
+    q_rms_weight_ptr = get_tensor_data_ptr(io_tensors_ptr, 3, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    k_rms_weight_ptr = get_tensor_data_ptr(io_tensors_ptr, 4, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
 
-    k_cache_ptr = k_cache_tensor.data_ptr(tl.bfloat16)
-    v_cache_ptr = v_cache_tensor.data_ptr(tl.bfloat16)
-
-    q_rms_weight_ptr = q_rms_weight_tensor.data_ptr(tl.bfloat16)
-    k_rms_weight_ptr = k_rms_weight_tensor.data_ptr(tl.bfloat16)
-
-    sin_cos_batch = cos_cache_tensor.size(0)
-    seq_len = qkv_tensor.size(1)
-    qkv_ptr = qkv_tensor.data_ptr(tl.bfloat16)
-    q_norm_rope_ptr = q_norm_rope_tensor.data_ptr(tl.bfloat16)
-    sin_ptr = sin_cache_tensor.data_ptr(tl.float32)
-    cos_ptr = cos_cache_tensor.data_ptr(tl.float32)
-    kv_lens_ptr = kv_lens_tensor.data_ptr(tl.int32)
-    block_table_ptr = block_tables_tensor.data_ptr(tl.int32)
+    sin_cos_batch = get_tensor_size(io_tensors_ptr, 5, 0, MAX_NUM_TENSOR_DIMS)
+    seq_len = get_tensor_size(io_tensors_ptr, 0, 1, MAX_NUM_TENSOR_DIMS)
+    qkv_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    q_norm_rope_ptr = get_tensor_data_ptr(io_tensors_ptr, 9, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    sin_ptr = get_tensor_data_ptr(io_tensors_ptr, 6, tl.float32, MAX_NUM_TENSOR_DIMS)
+    cos_ptr = get_tensor_data_ptr(io_tensors_ptr, 5, tl.float32, MAX_NUM_TENSOR_DIMS)
+    kv_lens_ptr = get_tensor_data_ptr(io_tensors_ptr, 2, tl.int32, MAX_NUM_TENSOR_DIMS)
+    block_table_ptr = get_tensor_data_ptr(io_tensors_ptr, 1, tl.int32, MAX_NUM_TENSOR_DIMS)
 
     tl.static_assert(Q_HEAD_DIM == V_HEAD_DIM)
     num_total_heads: tl.constexpr = NUM_Q_HEADS + NUM_KV_HEADS * 2
@@ -193,25 +186,28 @@ def rmsnorm_rope_update_kv_cache_task_compute(
             k_cache_ptr + (block_entry_id + global_seq_id % PAGE_SIZE) * stride_key_per_token +
             key_head_idx * K_HEAD_DIM + second_half_qk_offsets, new_qkv_tile_1, mask=second_qk_mask)
 
-    scoreboard.release_tile(task_base_info, tile_id)
+    release_tile(scoreboard_ptr, layer_id, task_id, tile_id, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)
 
 
 @triton.jit
 def rmsnorm_task_compute(
-    task_base_info: TaskBaseInfo,
-    scoreboard: Scoreboard,
+    io_tensors_ptr,
+    layer_id,
+    task_id,
+    tile_id_or_start,
+    scoreboard_ptr,
+    MAX_TASK_ID: tl.constexpr,
+    MAX_NUM_TILES_PER_OP: tl.constexpr,
+    MAX_NUM_TENSOR_DIMS: tl.constexpr,
     RMS_EPS: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
-    tile_id = task_base_info.tile_id_or_start
+    tile_id = tile_id_or_start
     row = tile_id
-    input_tensor: TensorDesc = task_base_info.get_tensor(0)
-    weight_tensor: TensorDesc = task_base_info.get_tensor(1)
-    output_tensor: TensorDesc = task_base_info.get_tensor(2)
-    input_ptr = input_tensor.data_ptr(tl.bfloat16)
-    weight_ptr = weight_tensor.data_ptr(tl.bfloat16)
-    output_ptr = output_tensor.data_ptr(tl.bfloat16)
-    N = output_tensor.size(1, 16)
+    input_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    weight_ptr = get_tensor_data_ptr(io_tensors_ptr, 1, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    output_ptr = get_tensor_data_ptr(io_tensors_ptr, 2, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    N = get_tensor_size(io_tensors_ptr, 2, 1, MAX_NUM_TENSOR_DIMS, 16)
 
     Y = output_ptr + row * N
     X = input_ptr + row * N
@@ -231,7 +227,7 @@ def rmsnorm_task_compute(
         y = w * (x * rms)
         tl.store(Y + cols, y, mask=mask)
 
-    scoreboard.release_tile(task_base_info, tile_id)
+    release_tile(scoreboard_ptr, layer_id, task_id, tile_id, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)
 
 
 @triton.jit
@@ -337,8 +333,14 @@ def _qkv_pack_qk_norm_rope_split_v_kernel(tile_id, qkv_ptr, kv_lens_ptr, q_rms_w
 
 @triton.jit
 def qkv_pack_qk_norm_rope_split_v_task_compute(
-    task_base_info: TaskBaseInfo,
-    scoreboard: Scoreboard,
+    io_tensors_ptr,
+    layer_id,
+    task_id,
+    tile_id_or_start,
+    scoreboard_ptr,
+    MAX_TASK_ID: tl.constexpr,
+    MAX_NUM_TILES_PER_OP: tl.constexpr,
+    MAX_NUM_TENSOR_DIMS: tl.constexpr,
     DTYPE: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
@@ -348,29 +350,19 @@ def qkv_pack_qk_norm_rope_split_v_task_compute(
     BLOCK_SEQ: tl.constexpr,
     BLOCK_HD: tl.constexpr,
 ):
-
-    tile_id = task_base_info.tile_id_or_start
-    qkv_tensor: TensorDesc = task_base_info.get_tensor(0)
-    kv_lens_tensor: TensorDesc = task_base_info.get_tensor(1)
-    q_rms_weight_tensor: TensorDesc = task_base_info.get_tensor(2)
-    k_rms_weight_tensor: TensorDesc = task_base_info.get_tensor(3)
-    cos_tensor: TensorDesc = task_base_info.get_tensor(4)
-    sin_tensor: TensorDesc = task_base_info.get_tensor(5)
-    q_norm_rope_tensor: TensorDesc = task_base_info.get_tensor(6)
-    k_norm_rope_tensor: TensorDesc = task_base_info.get_tensor(7)
-    v_tensor: TensorDesc = task_base_info.get_tensor(8)
-    qkv_ptr = qkv_tensor.data_ptr(DTYPE)
-    kv_lens_ptr = kv_lens_tensor.data_ptr(tl.int32)
-    q_rms_weight_ptr = q_rms_weight_tensor.data_ptr(DTYPE)
-    k_rms_weight_ptr = k_rms_weight_tensor.data_ptr(DTYPE)
-    sin_ptr = sin_tensor.data_ptr(tl.float32)
-    cos_ptr = cos_tensor.data_ptr(tl.float32)
-    q_norm_rope_ptr = q_norm_rope_tensor.data_ptr(DTYPE)
-    k_norm_rope_ptr = k_norm_rope_tensor.data_ptr(DTYPE)
-    v_ptr = v_tensor.data_ptr(DTYPE)
+    tile_id = tile_id_or_start
+    qkv_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, DTYPE, MAX_NUM_TENSOR_DIMS)
+    kv_lens_ptr = get_tensor_data_ptr(io_tensors_ptr, 1, tl.int32, MAX_NUM_TENSOR_DIMS)
+    q_rms_weight_ptr = get_tensor_data_ptr(io_tensors_ptr, 2, DTYPE, MAX_NUM_TENSOR_DIMS)
+    k_rms_weight_ptr = get_tensor_data_ptr(io_tensors_ptr, 3, DTYPE, MAX_NUM_TENSOR_DIMS)
+    sin_ptr = get_tensor_data_ptr(io_tensors_ptr, 5, tl.float32, MAX_NUM_TENSOR_DIMS)
+    cos_ptr = get_tensor_data_ptr(io_tensors_ptr, 4, tl.float32, MAX_NUM_TENSOR_DIMS)
+    q_norm_rope_ptr = get_tensor_data_ptr(io_tensors_ptr, 6, DTYPE, MAX_NUM_TENSOR_DIMS)
+    k_norm_rope_ptr = get_tensor_data_ptr(io_tensors_ptr, 7, DTYPE, MAX_NUM_TENSOR_DIMS)
+    v_ptr = get_tensor_data_ptr(io_tensors_ptr, 8, DTYPE, MAX_NUM_TENSOR_DIMS)
 
     # [bs, seq_len, num_total_heads, head_dim]
-    seq_len = qkv_tensor.size(1)
+    seq_len = get_tensor_size(io_tensors_ptr, 0, 1, MAX_NUM_TENSOR_DIMS)
 
     _qkv_pack_qk_norm_rope_split_v_kernel(tile_id, qkv_ptr, kv_lens_ptr, q_rms_weight_ptr, k_rms_weight_ptr,  #
                                           Q_RMS_EPS, K_RMS_EPS, sin_ptr, cos_ptr,  #
@@ -380,4 +372,4 @@ def qkv_pack_qk_norm_rope_split_v_task_compute(
                                           BLOCK_SEQ=BLOCK_SEQ,  #
                                           BLOCK_HD=BLOCK_HD)
 
-    scoreboard.release_tile(task_base_info, tile_id)
+    release_tile(scoreboard_ptr, layer_id, task_id, tile_id, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)

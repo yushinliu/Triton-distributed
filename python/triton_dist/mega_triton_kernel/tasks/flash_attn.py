@@ -23,7 +23,7 @@
 #
 ################################################################################
 from typing import Tuple, List
-from .utils import cdiv, torch_dtype_to_triton_dtype_str
+from .utils import TASK_COMPUTE_ARGS, cdiv, torch_dtype_to_triton_dtype_str
 import dataclasses
 from dataclasses import dataclass
 from ..core.task_base import TaskBase, TaskDependency, InputDependencyDesc, OutputTilingDesc
@@ -79,7 +79,7 @@ def _codegen_flash_attn_impl(task: FlashAttnTask, NUM_KV_HEADS, qkv_pack=False) 
     fn_name = "qkv_pack_flash_attn_task_compute" if qkv_pack else "flash_attn_task_compute"
     code = f"""
 {fn_name}(
-    task_base_info, scoreboard, SM_SCALE={task.extra_params["sm_scale"]}, SOFT_CAP={task.extra_params["soft_cap"]},
+    {TASK_COMPUTE_ARGS}, SM_SCALE={task.extra_params["sm_scale"]}, SOFT_CAP={task.extra_params["soft_cap"]},
     INPUT_DTYPE={INPUT_DTYPE}, OUTPUT_DTYPE={OUTPUT_DTYPE},
     NUM_Q_HEADS={NUM_Q_HEADS}, NUM_KV_HEADS={NUM_KV_HEADS}, HEAD_DIM={HEAD_DIM},
     BLOCK_M={config.BLOCK_M}, BLOCK_N={config.BLOCK_N}, NUM_STAGES={config.NUM_STAGES},

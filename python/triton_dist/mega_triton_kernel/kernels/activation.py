@@ -24,7 +24,7 @@
 ################################################################################
 import triton
 import triton.language as tl
-from .task_context import TaskBaseInfo, Scoreboard
+from .task_context import get_tensor_data_ptr, get_tensor_size, release_tile
 
 
 @triton.jit
@@ -61,18 +61,15 @@ def act_mul_up_tile_compute(tile_id, input, output, M, N, ACT_FN, BLOCK_SIZE_M: 
 
 
 @triton.jit
-def silu_mul_up_task_compute(task_base_info: TaskBaseInfo, scoreboard: Scoreboard, BLOCK_SIZE_M: tl.constexpr,
+def silu_mul_up_task_compute(io_tensors_ptr, layer_id, task_id, tile_id_or_start, scoreboard_ptr,
+                             MAX_TASK_ID: tl.constexpr, MAX_NUM_TILES_PER_OP: tl.constexpr,
+                             MAX_NUM_TENSOR_DIMS: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
                              BLOCK_SIZE_N: tl.constexpr):
-    # scoreboard.wait_deps(task_base_info)
-
-    input = task_base_info.get_tensor(0)
-    output = task_base_info.get_tensor(1)
-
-    M = output.size(0, 16)
-    N = output.size(1, 16)
+    M = get_tensor_size(io_tensors_ptr, 1, 0, MAX_NUM_TENSOR_DIMS, 16)
+    N = get_tensor_size(io_tensors_ptr, 1, 1, MAX_NUM_TENSOR_DIMS, 16)
     ACT_FN: tl.constexpr = tl.constexpr("silu")
-    a_ptr = input.data_ptr(tl.bfloat16)
-    b_ptr = output.data_ptr(tl.bfloat16)
+    a_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    b_ptr = get_tensor_data_ptr(io_tensors_ptr, 1, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
 
-    act_mul_up_tile_compute(task_base_info.tile_id_or_start, a_ptr, b_ptr, M, N, ACT_FN, BLOCK_SIZE_M, BLOCK_SIZE_N)
-    scoreboard.release_tile(task_base_info, task_base_info.tile_id_or_start)
+    act_mul_up_tile_compute(tile_id_or_start, a_ptr, b_ptr, M, N, ACT_FN, BLOCK_SIZE_M, BLOCK_SIZE_N)
+    release_tile(scoreboard_ptr, layer_id, task_id, tile_id_or_start, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)

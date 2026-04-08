@@ -23,7 +23,7 @@
 #
 ################################################################################
 from typing import List
-from .utils import cdiv
+from .utils import TASK_COMPUTE_ARGS, cdiv
 import dataclasses
 from dataclasses import dataclass
 from ..core.task_base import TaskBase, TaskDependency
@@ -55,7 +55,7 @@ def codegen_allreduce(task: AllReduceConfig) -> str:
     config: AllReduceConfig = task.config
 
     code = f"""
-allreduce_task_compute(task_base_info, scoreboard, BLOCK_SIZE={config.BLOCK_SIZE})
+allreduce_task_compute({TASK_COMPUTE_ARGS}, BLOCK_SIZE={config.BLOCK_SIZE})
 """
     return code
 
@@ -65,7 +65,7 @@ def codegen_allreduce_nvshmem(task: AllReduceNVSHMEMTask) -> str:
     scratch_tensor = task.io_tensors[0][1]
     num_local_pes = scratch_tensor.numel() // (task.num_tiles * config.BLOCK_SIZE)
     code = f"""
-allreduce_nvshmem_task_compute(task_base_info, scoreboard, BLOCK_SIZE={config.BLOCK_SIZE}, NUM_LOCAL_PES={num_local_pes})
+allreduce_nvshmem_task_compute({TASK_COMPUTE_ARGS}, BLOCK_SIZE={config.BLOCK_SIZE}, NUM_LOCAL_PES={num_local_pes})
 """
     return code
 

@@ -25,7 +25,7 @@
 import triton
 import triton.language as tl
 from triton_dist.language.extra.language_extra import st
-from .task_context import TaskBaseInfo, Scoreboard, TensorDesc
+from .task_context import get_tensor_data_ptr, get_tensor_size, release_tile
 
 
 @triton.jit
@@ -78,45 +78,39 @@ def tile_range_matmul_compute_and_notify(tile_start, sb_base_ptr, a_ptr, b_ptr, 
 
 
 @triton.jit
-def linear_task_compute(task_base_info: TaskBaseInfo, scoreboard: Scoreboard, BLOCK_SIZE_M: tl.constexpr,
-                        BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, NUM_STAGES: tl.constexpr,
+def linear_task_compute(io_tensors_ptr, layer_id, task_id, tile_id_or_start, scoreboard_ptr,
+                        MAX_TASK_ID: tl.constexpr, MAX_NUM_TILES_PER_OP: tl.constexpr,
+                        MAX_NUM_TENSOR_DIMS: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+                        BLOCK_SIZE_K: tl.constexpr, NUM_STAGES: tl.constexpr,
                         ALIGNMENT_K: tl.constexpr):
+    M = get_tensor_size(io_tensors_ptr, 0, 0, MAX_NUM_TENSOR_DIMS)
+    K = get_tensor_size(io_tensors_ptr, 0, 1, MAX_NUM_TENSOR_DIMS, ALIGNMENT_K)
+    N = get_tensor_size(io_tensors_ptr, 1, 0, MAX_NUM_TENSOR_DIMS)
+    a_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    b_ptr = get_tensor_data_ptr(io_tensors_ptr, 1, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    c_ptr = get_tensor_data_ptr(io_tensors_ptr, 2, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
 
-    input: TensorDesc = task_base_info.get_tensor(0)
-    weight: TensorDesc = task_base_info.get_tensor(1)
-    output: TensorDesc = task_base_info.get_tensor(2)
-
-    M = input.size(0)
-    K = input.size(1, ALIGNMENT_K)
-    N = weight.size(0)
-    a_ptr = input.data_ptr(tl.bfloat16)
-    b_ptr = weight.data_ptr(tl.bfloat16)
-    c_ptr = output.data_ptr(tl.bfloat16)
-
-    tile_id = task_base_info.tile_id_or_start
+    tile_id = tile_id_or_start
     tile_wise_matmul_compute(tile_id, a_ptr, b_ptr, c_ptr, M, N, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
                              NUM_STAGES)
-    scoreboard.release_tile(task_base_info, tile_id)
+    release_tile(scoreboard_ptr, layer_id, task_id, tile_id, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)
 
 
 @triton.jit
-def linear_add_task_compute(task_base_info: TaskBaseInfo, scoreboard: Scoreboard, BLOCK_SIZE_M: tl.constexpr,
+def linear_add_task_compute(io_tensors_ptr, layer_id, task_id, tile_id_or_start, scoreboard_ptr,
+                            MAX_TASK_ID: tl.constexpr, MAX_NUM_TILES_PER_OP: tl.constexpr,
+                            MAX_NUM_TENSOR_DIMS: tl.constexpr, BLOCK_SIZE_M: tl.constexpr,
                             BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, NUM_STAGES: tl.constexpr,
                             ALIGNMENT_K: tl.constexpr):
-    input: TensorDesc = task_base_info.get_tensor(0)
-    weight: TensorDesc = task_base_info.get_tensor(1)
-    residual: TensorDesc = task_base_info.get_tensor(2)
-    output: TensorDesc = task_base_info.get_tensor(3)
+    M = get_tensor_size(io_tensors_ptr, 0, 0, MAX_NUM_TENSOR_DIMS)
+    K = get_tensor_size(io_tensors_ptr, 0, 1, MAX_NUM_TENSOR_DIMS, ALIGNMENT_K)
+    N = get_tensor_size(io_tensors_ptr, 1, 0, MAX_NUM_TENSOR_DIMS)
+    a_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    b_ptr = get_tensor_data_ptr(io_tensors_ptr, 1, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    r_ptr = get_tensor_data_ptr(io_tensors_ptr, 2, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
+    c_ptr = get_tensor_data_ptr(io_tensors_ptr, 3, tl.bfloat16, MAX_NUM_TENSOR_DIMS)
 
-    M = input.size(0)
-    K = input.size(1, ALIGNMENT_K)
-    N = weight.size(0)
-    a_ptr = input.data_ptr(tl.bfloat16)
-    b_ptr = weight.data_ptr(tl.bfloat16)
-    r_ptr = residual.data_ptr(tl.bfloat16)
-    c_ptr = output.data_ptr(tl.bfloat16)
-
-    tile_id = task_base_info.tile_id_or_start
+    tile_id = tile_id_or_start
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
     offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
@@ -150,4 +144,4 @@ def linear_add_task_compute(task_base_info: TaskBaseInfo, scoreboard: Scoreboard
     residual_tile = tl.load(residual_ptrs, mask=out_mask, other=0.0).to(tl.float32)
     out = (accumulator + residual_tile).to(c_ptr.dtype.element_ty)
     tl.store(out_ptrs, out, mask=out_mask)
-    scoreboard.release_tile(task_base_info, tile_id)
+    release_tile(scoreboard_ptr, layer_id, task_id, tile_id, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)

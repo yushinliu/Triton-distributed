@@ -26,7 +26,7 @@ from triton import next_power_of_2
 from typing import Tuple, List
 import dataclasses
 from dataclasses import dataclass
-from .utils import build_tile_desc, torch_dtype_to_triton_dtype_str, cdiv
+from .utils import TASK_COMPUTE_ARGS, build_tile_desc, torch_dtype_to_triton_dtype_str, cdiv
 from ..core.task_base import TaskBase, TaskDependency, InputDependencyDesc, OutputTilingDesc
 from ..core.builder import TaskBuilderBase
 from ..core.registry import registry
@@ -99,7 +99,7 @@ def codegen_qk_norm_rope_update_kvcache(task: QKNormRopeUpdateKVCacheTask) -> st
     MAX_NUM_BLOCKS_PER_SEQ = block_tables.shape[-1]
     code = f"""
 rmsnorm_rope_update_kv_cache_task_compute(
-    task_base_info, scoreboard, NUM_Q_HEADS={NUM_Q_HEADS}, NUM_KV_HEADS={NUM_KV_HEADS}, Q_HEAD_DIM={Q_HEAD_DIM},
+    {TASK_COMPUTE_ARGS}, NUM_Q_HEADS={NUM_Q_HEADS}, NUM_KV_HEADS={NUM_KV_HEADS}, Q_HEAD_DIM={Q_HEAD_DIM},
     V_HEAD_DIM={V_HEAD_DIM}, PAGE_SIZE={PAGE_SIZE}, MAX_NUM_BLOCKS_PER_SEQ={MAX_NUM_BLOCKS_PER_SEQ},
     Q_RMS_EPS={task.extra_params["q_rms_eps"]}, K_RMS_EPS={task.extra_params["k_rms_eps"]},
     SKIP_Q_NORM={task.extra_params["skip_q_norm"]}, SKIP_K_NORM={task.extra_params["skip_k_norm"]},
@@ -111,7 +111,7 @@ rmsnorm_rope_update_kv_cache_task_compute(
 def codegen_rms_norm(task: RMSNormTask) -> str:
     config: RMSNormConfig = task.config
     code = f"""
-rmsnorm_task_compute(task_base_info, scoreboard, RMS_EPS={task.extra_params["rms_eps"]}, BLOCK_SIZE_N = {config.BLOCK_SIZE_N})
+rmsnorm_task_compute({TASK_COMPUTE_ARGS}, RMS_EPS={task.extra_params["rms_eps"]}, BLOCK_SIZE_N = {config.BLOCK_SIZE_N})
 """
     return code
 
@@ -125,7 +125,7 @@ def codegen_qkv_pack_qk_norm_rope_split_v(task: QKVPackQKNormRopeSplitVTask) -> 
     NUM_KV_HEADS = k_norm_rope.shape[-2]
     code = f"""
 qkv_pack_qk_norm_rope_split_v_task_compute(
-    task_base_info, scoreboard, DTYPE={triton_dtype}, NUM_Q_HEADS={NUM_Q_HEADS}, NUM_KV_HEADS={NUM_KV_HEADS}, HEAD_DIM={HEAD_DIM},
+    {TASK_COMPUTE_ARGS}, DTYPE={triton_dtype}, NUM_Q_HEADS={NUM_Q_HEADS}, NUM_KV_HEADS={NUM_KV_HEADS}, HEAD_DIM={HEAD_DIM},
     Q_RMS_EPS={task.extra_params["q_rms_eps"]}, K_RMS_EPS={task.extra_params["k_rms_eps"]},
     BLOCK_SEQ={task.config.BLOCK_SEQ}, BLOCK_HD={task.config.BLOCK_HD},
 )

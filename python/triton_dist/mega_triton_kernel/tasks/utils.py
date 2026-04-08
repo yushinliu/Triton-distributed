@@ -25,6 +25,12 @@
 from typing import List, Tuple
 import torch
 
+TASK_COMPUTE_ARGS = (
+    "io_tensors_ptr, layer_id, task_id, tile_id_or_start, scoreboard_ptr, "
+    "MAX_TASK_ID=MAX_TASK_ID, MAX_NUM_TILES_PER_OP=MAX_NUM_TILES_PER_OP, "
+    "MAX_NUM_TENSOR_DIMS=MAX_NUM_TENSOR_DIMS"
+)
+
 
 def build_tile_desc(full_shape: List[int], tile_sizes: List[int], tile_id: int,
                     return_valid_size=False) -> Tuple[List[int], List[int]]:

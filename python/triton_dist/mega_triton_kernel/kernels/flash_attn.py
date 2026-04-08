@@ -25,7 +25,7 @@
 
 import triton
 import triton.language as tl
-from .task_context import TaskBaseInfo, Scoreboard
+from .task_context import get_tensor_data_ptr, get_tensor_size, release_tile
 from .utils import tanh
 
 
@@ -286,8 +286,14 @@ def _attn_fwd(
 
 @triton.jit
 def qkv_pack_flash_attn_task_compute(
-    task_base_info: TaskBaseInfo,
-    scoreboard: Scoreboard,
+    io_tensors_ptr,
+    layer_id,
+    task_id,
+    tile_id_or_start,
+    scoreboard_ptr,
+    MAX_TASK_ID: tl.constexpr,
+    MAX_NUM_TILES_PER_OP: tl.constexpr,
+    MAX_NUM_TENSOR_DIMS: tl.constexpr,
     SM_SCALE: tl.constexpr,
     SOFT_CAP: tl.constexpr,
     INPUT_DTYPE: tl.constexpr,
@@ -300,12 +306,10 @@ def qkv_pack_flash_attn_task_compute(
     NUM_STAGES: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
 ):
-
-    tile_id = task_base_info.tile_id_or_start
-    qkv_tensor = task_base_info.get_tensor(0)
-    qkv_ptr = qkv_tensor.data_ptr(INPUT_DTYPE)
-    out_ptr = task_base_info.get_tensor(1).data_ptr(OUTPUT_DTYPE)
-    N_CTX = qkv_tensor.size(1)
+    tile_id = tile_id_or_start
+    qkv_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, INPUT_DTYPE, MAX_NUM_TENSOR_DIMS)
+    out_ptr = get_tensor_data_ptr(io_tensors_ptr, 1, OUTPUT_DTYPE, MAX_NUM_TENSOR_DIMS)
+    N_CTX = get_tensor_size(io_tensors_ptr, 0, 1, MAX_NUM_TENSOR_DIMS)
     _qkv_pack_attn_fwd(
         tile_id,
         qkv_ptr,
@@ -321,13 +325,19 @@ def qkv_pack_flash_attn_task_compute(
         NUM_STAGES=NUM_STAGES,
         IS_CAUSAL=IS_CAUSAL,
     )
-    scoreboard.release_tile(task_base_info, tile_id)
+    release_tile(scoreboard_ptr, layer_id, task_id, tile_id, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)
 
 
 @triton.jit
 def flash_attn_task_compute(
-    task_base_info: TaskBaseInfo,
-    scoreboard: Scoreboard,
+    io_tensors_ptr,
+    layer_id,
+    task_id,
+    tile_id_or_start,
+    scoreboard_ptr,
+    MAX_TASK_ID: tl.constexpr,
+    MAX_NUM_TILES_PER_OP: tl.constexpr,
+    MAX_NUM_TENSOR_DIMS: tl.constexpr,
     SM_SCALE: tl.constexpr,
     SOFT_CAP: tl.constexpr,
     INPUT_DTYPE: tl.constexpr,
@@ -340,18 +350,12 @@ def flash_attn_task_compute(
     NUM_STAGES: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
 ):
-
-    tile_id = task_base_info.tile_id_or_start
-    q_tensor = task_base_info.get_tensor(0)
-    k_tensor = task_base_info.get_tensor(1)
-    v_tensor = task_base_info.get_tensor(2)
-
-    q_ptr = q_tensor.data_ptr(INPUT_DTYPE)
-    k_ptr = k_tensor.data_ptr(INPUT_DTYPE)
-    v_ptr = v_tensor.data_ptr(INPUT_DTYPE)
-
-    out_ptr = task_base_info.get_tensor(3).data_ptr(OUTPUT_DTYPE)
-    N_CTX = q_tensor.size(1)
+    tile_id = tile_id_or_start
+    q_ptr = get_tensor_data_ptr(io_tensors_ptr, 0, INPUT_DTYPE, MAX_NUM_TENSOR_DIMS)
+    k_ptr = get_tensor_data_ptr(io_tensors_ptr, 1, INPUT_DTYPE, MAX_NUM_TENSOR_DIMS)
+    v_ptr = get_tensor_data_ptr(io_tensors_ptr, 2, INPUT_DTYPE, MAX_NUM_TENSOR_DIMS)
+    out_ptr = get_tensor_data_ptr(io_tensors_ptr, 3, OUTPUT_DTYPE, MAX_NUM_TENSOR_DIMS)
+    N_CTX = get_tensor_size(io_tensors_ptr, 0, 1, MAX_NUM_TENSOR_DIMS)
     _attn_fwd(
         tile_id,
         q_ptr,
@@ -369,4 +373,4 @@ def flash_attn_task_compute(
         NUM_STAGES=NUM_STAGES,
         IS_CAUSAL=IS_CAUSAL,
     )
-    scoreboard.release_tile(task_base_info, tile_id)
+    release_tile(scoreboard_ptr, layer_id, task_id, tile_id, MAX_TASK_ID, MAX_NUM_TILES_PER_OP)

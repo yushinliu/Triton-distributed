@@ -23,7 +23,7 @@
 #
 ################################################################################
 from typing import Any, Dict, List
-from .utils import cdiv
+from .utils import TASK_COMPUTE_ARGS, cdiv
 from dataclasses import dataclass
 from ..core.task_base import TaskBase, TaskDependency, InputDependencyDesc, OutputTilingDesc, DeviceProp
 from ..core.builder import TaskBuilderBase
@@ -55,7 +55,7 @@ def silu_mul_up_config_factory(**kwargs) -> SiLUMulUpConfig:
 def codegen_silu_mul_up_fc1(task: SiLUMulUpTask) -> str:
     config: SiLUMulUpConfig = task.config
     code = f"""
-silu_mul_up_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N})
+silu_mul_up_task_compute({TASK_COMPUTE_ARGS}, BLOCK_SIZE_M={config.BLOCK_SIZE_M}, BLOCK_SIZE_N={config.BLOCK_SIZE_N})
 """
     return code
 
