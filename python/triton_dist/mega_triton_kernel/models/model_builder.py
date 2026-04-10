@@ -35,7 +35,7 @@ from ..core.task_base import TaskBase, DeviceProp, TaskDependency, TaskIDManager
 from ..core.builder import TaskBuilderBase
 from ..core.graph import Graph
 from typing import List, Dict, Any
-from triton_dist.utils import NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensor, nvshmem_free_tensor_sync
+from triton_dist.utils import nvshmem_create_tensor, nvshmem_free_tensor_sync
 from ..core.scheduler import enque_tasks
 from triton_dist.models.utils import logger
 from triton_dist.tools.profiler import alloc_profiler_buffer, export_to_perfetto_trace, reset_profiler_buffer, parse_to_tracks
@@ -540,18 +540,15 @@ class ModelBuilder:
             builder_cls = self.get_task_builder("allreduce_nvshmem")
             kernel_config = builder_cls.create_config()
             num_tiles = (input.numel() + kernel_config.BLOCK_SIZE - 1) // kernel_config.BLOCK_SIZE
-            num_chunks = (kernel_config.BLOCK_SIZE + kernel_config.CHUNK_SIZE - 1) // kernel_config.CHUNK_SIZE
             scratch_buf = self.create_symm_tensor((num_tiles * self.local_world_size * kernel_config.BLOCK_SIZE, ),
                                                   input.dtype)
-            signal_buf = self.create_symm_tensor((num_tiles * self.local_world_size * num_chunks, ),
-                                                 NVSHMEM_SIGNAL_DTYPE)
         else:
             raise ValueError(f"Unsupported allreduce implementation: {implementation}")
         self.make_barrier_all_intra_node(wait_inputs=[input], layer_id=layer_id)
         if implementation == "multimem":
             self._convert_op("allreduce", layer_id, [[input], [output]])
         else:
-            self._convert_op("allreduce_nvshmem", layer_id, [[input, scratch_buf, signal_buf], [output]])
+            self._convert_op("allreduce_nvshmem", layer_id, [[input, scratch_buf], [output]])
         if not double_input_buffer:
             self.make_barrier_all_intra_node(wait_inputs=[output], layer_id=layer_id)
 
