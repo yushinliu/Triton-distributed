@@ -111,14 +111,6 @@ class ModelBuilder:
         assert self.world_size > 0 and self.local_world_size > 0
         self.all_symm_tensors = []
         self.allreduce_phase_tensors = []
-        if self.world_size > 1:
-            self.barrier_all_intra_node_buf = self.create_symm_tensor([
-                world_size,
-            ], torch.int32)
-            self.barrier_all_intra_node_buf.zero_()
-            torch.distributed.barrier()
-        else:
-            self.barrier_all_intra_node_buf = None
         self.logger = logger
         self._enable_profiling = enable_profiling
         self._enable_dep_opt = enable_dep_opt
@@ -526,9 +518,7 @@ class ModelBuilder:
         """
         assert self.world_size > 1
         wait_inputs = [] if wait_inputs is None else wait_inputs
-        extra_params = {"local_rank": self.local_rank, "local_world_size": self.local_world_size}
-        self._convert_op("barrier_all_intra_node", layer_id,
-                         [[self.barrier_all_intra_node_buf] + wait_inputs, wait_inputs], extra_params)
+        self._convert_op("barrier_all_intra_node", layer_id, [wait_inputs, wait_inputs])
 
     def make_allreduce(self, input: torch.Tensor, output: torch.Tensor, double_input_buffer=False, layer_id=0,
                        implementation="multimem"):

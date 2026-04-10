@@ -25,7 +25,7 @@
 from typing import Tuple, List
 import dataclasses
 from dataclasses import dataclass
-from ..core.task_base import TaskBase, TaskDependency, MAX_NUM_TENSOR_DIMS
+from ..core.task_base import TaskBase, TaskDependency
 from ..core.builder import TaskBuilderBase
 from ..core.registry import registry
 from ..core.config import ConfigBase
@@ -41,27 +41,11 @@ class BarrierAllIntraNodeTask(TaskBase):
     config: BarrierAllIntraNodeConfig
 
     def extra_params_to_tuple(self) -> Tuple[int]:
-        return (self.extra_params["local_rank"], self.extra_params["local_world_size"])
+        return ()
 
     def io_to_tuple(self):
-        io_tuple = tuple()
-        assert len(self.io_tensors) == 2
-        assert len(self.io_tensors[0]) - len(self.io_tensors[1]) == 1
-        # inputs/outputs except barrier are only used to build dependency in graph level and are useless for the kernel.
-        barrier_tensor = self.io_tensors[0][0]
-
-        data_ptr = barrier_tensor.data_ptr()
-        ptr_high = (data_ptr >> 32) & 0xFFFFFFFF
-        ptr_low = data_ptr & 0xFFFFFFFF
-
-        shape = list(barrier_tensor.shape)
-        assert MAX_NUM_TENSOR_DIMS >= len(shape)
-        padded_shape = shape + [1] * (MAX_NUM_TENSOR_DIMS - len(shape))
-
-        tensor_tuple = (ptr_low, ptr_high) + tuple(padded_shape)
-        assert len(tensor_tuple) % 2 == 0, "tensor data_ptr alignemnt"
-        io_tuple += tensor_tuple
-        return io_tuple
+        # Barrier inputs/outputs are only used at graph level to carry dependencies.
+        return ()
 
 
 def barrier_all_intra_node_config_factory(**kwargs) -> BarrierAllIntraNodeConfig:
