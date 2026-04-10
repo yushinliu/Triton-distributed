@@ -163,6 +163,17 @@ class ModelBuilder:
             self.max_layer_id = max(task.layer_id, self.max_layer_id)
             self.max_task_id = max(task.task_id, self.max_task_id)
 
+    @staticmethod
+    def _interleave_tasks(first_tasks: List[TaskBase], second_tasks: List[TaskBase]) -> List[TaskBase]:
+        interleaved = []
+        max_len = max(len(first_tasks), len(second_tasks))
+        for idx in range(max_len):
+            if idx < len(first_tasks):
+                interleaved.append(first_tasks[idx])
+            if idx < len(second_tasks):
+                interleaved.append(second_tasks[idx])
+        return interleaved
+
     def get_sm_activity(self):
         assert self._enable_profiling
         block_idx_to_tracks = parse_to_tracks(self.profile_buf)
@@ -538,6 +549,8 @@ class ModelBuilder:
             assert os.getenv("NVSHMEM_DISABLE_CUDA_VMM", "1") == "0"  # for multicast
             assert nbytes % 128 == 0
         elif implementation == "nvshmem":
+            if self._enable_runtime_scheduler:
+                raise ValueError("NVSHMEM allreduce overlap path does not support enable_runtime_scheduler=True")
             builder_cls = self.get_task_builder("allreduce_nvshmem")
             kernel_config = builder_cls.create_config()
             num_tiles = (input.numel() + kernel_config.BLOCK_SIZE - 1) // kernel_config.BLOCK_SIZE
@@ -553,9 +566,34 @@ class ModelBuilder:
         if implementation == "multimem":
             self._convert_op("allreduce", layer_id, [[input], [output]])
         else:
-            self._convert_op("allreduce_nvshmem_push", layer_id, [[input, scratch_buf, signal_buf, phase_buf],
-                                                                  [scratch_buf, signal_buf]])
-            self._convert_op("allreduce_nvshmem", layer_id, [[scratch_buf, signal_buf, phase_buf], [output]])
+            local_io_tensors = [[input, scratch_buf, signal_buf, phase_buf], [output]]
+            push_io_tensors = [[input, scratch_buf, signal_buf, phase_buf], []]
+            local_builder_cls = self.get_task_builder("allreduce_nvshmem")
+            push_builder_cls = self.get_task_builder("allreduce_nvshmem_push")
+            local_tasks = local_builder_cls.build_tasks(device_prop=self.device_prop,
+                                                        layer_id=layer_id,
+                                                        dependency=self.last_dependency,
+                                                        io_tensors=local_io_tensors,
+                                                        extra_params={})
+            push_tasks = push_builder_cls.build_tasks(device_prop=self.device_prop,
+                                                      layer_id=layer_id,
+                                                      dependency=TaskDependency(),
+                                                      io_tensors=push_io_tensors,
+                                                      extra_params={})
+            self._update_tasks(local_tasks)
+            self._graph.new_node(tasks=local_tasks,
+                                 op_type="allreduce_nvshmem",
+                                 io_tensors=local_io_tensors,
+                                 extra_params={})
+            self._update_metrics("allreduce_nvshmem", local_io_tensors)
+            self._update_tasks(push_tasks, do_not_update_dependency=True)
+            self._graph.new_node(tasks=push_tasks,
+                                 op_type="allreduce_nvshmem_push",
+                                 io_tensors=push_io_tensors,
+                                 extra_params={})
+            self._update_metrics("allreduce_nvshmem_push", push_io_tensors)
+            num_allreduce_tasks = len(local_tasks) + len(push_tasks)
+            self.megakernel_tasks[-num_allreduce_tasks:] = self._interleave_tasks(local_tasks, push_tasks)
         if not double_input_buffer:
             self.make_barrier_all_intra_node(wait_inputs=[output], layer_id=layer_id)
 
@@ -582,9 +620,9 @@ class ModelBuilder:
     def compile(self):
         self.logger.log(f"num_total_tasks = {len(self.megakernel_tasks)}", level="debug")
         if self._enable_dep_opt:
-            megakernel_tasks = self._graph.to_tasks()
-        else:
-            megakernel_tasks = self.megakernel_tasks
+            # Build optimized dependencies in-place without overriding the explicit enqueue order.
+            self._graph.to_tasks()
+        megakernel_tasks = self.megakernel_tasks
         if self._enable_runtime_scheduler:
             num_sms = 1
         else:

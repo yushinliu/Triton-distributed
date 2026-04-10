@@ -148,9 +148,9 @@ class Graph:
                         task_deps_cur_task += _deps_list_to_dependency(deps_tile_ids_from_cur_producer,
                                                                        layer_id=producer_tasks_list[0].layer_id,
                                                                        task_id=producer_tasks_list[0].task_id)
-                if len(cur_task.dependency) != len(
-                        task_deps_cur_task) or task_deps_cur_task[0].start_tiles != cur_task.dependency[
-                            0].start_tiles or task_deps_cur_task[0].end_tiles != cur_task.dependency[0].end_tiles:
+                old_deps = [(dep.layer_id, dep.task_id, dep.start_tiles, dep.end_tiles) for dep in cur_task.dependency]
+                new_deps = [(dep.layer_id, dep.task_id, dep.start_tiles, dep.end_tiles) for dep in task_deps_cur_task]
+                if old_deps != new_deps:
                     self._logger.log(f"cur_task = {cur_task}, task_deps_cur_task = {task_deps_cur_task}", level="debug")
                 cur_task.dependency = task_deps_cur_task
                 all_tasks_after_build_deps.append(cur_task)

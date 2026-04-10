@@ -67,7 +67,7 @@ allreduce_task_compute(task_base_info, scoreboard, BLOCK_SIZE={config.BLOCK_SIZE
 
 def codegen_allreduce_nvshmem(task: AllReduceNVSHMEMTask) -> str:
     config: AllReduceConfig = task.config
-    scratch_tensor = task.io_tensors[0][0]
+    scratch_tensor = task.io_tensors[0][1]
     num_local_pes = scratch_tensor.numel() // (task.num_tiles * config.BLOCK_SIZE)
     code = f"""
 allreduce_nvshmem_task_compute(task_base_info, scoreboard, BLOCK_SIZE={config.BLOCK_SIZE}, NUM_LOCAL_PES={num_local_pes})
@@ -124,16 +124,14 @@ class AllReduceNVSHMEMPushTaskBuilder(TaskBuilderBase):
     def _build_tasks_impl(cls, device_prop, layer_id: int, dependency: TaskDependency, io_tensors, extra_params,
                           tile_wise=True) -> List[TaskBase]:
         input, scratch, signal, phase = io_tensors[0]
-        scratch_out, signal_out = io_tensors[1]
+        assert len(io_tensors[1]) == 0
         num_elements = input.numel()
-        assert len(input.shape) == 1
+        assert len(input.shape) == 1 and len(scratch.shape) == 1
         task_id = cls.get_task_id(layer_id)
         kernel_config = cls.create_config()
         num_tiles = cdiv(num_elements, kernel_config.BLOCK_SIZE)
         assert scratch.numel() % (num_tiles * kernel_config.BLOCK_SIZE) == 0
         num_local_pes = scratch.numel() // (num_tiles * kernel_config.BLOCK_SIZE)
-        assert scratch_out.data_ptr() == scratch.data_ptr()
-        assert signal_out.data_ptr() == signal.data_ptr()
         assert signal.numel() == num_tiles * num_local_pes
 
         cls.log(
@@ -143,23 +141,14 @@ class AllReduceNVSHMEMPushTaskBuilder(TaskBuilderBase):
         for i in range(num_tiles):
             tile_start = i * kernel_config.BLOCK_SIZE
             tile_size = min(kernel_config.BLOCK_SIZE, num_elements - tile_start)
-            scratch_start = i * num_local_pes * kernel_config.BLOCK_SIZE
-            signal_start = i * num_local_pes
             input_desc = InputDependencyDesc(input, require_full=False, start_indices=(tile_start, ),
                                              data_sizes=(tile_size, ))
             phase_desc = InputDependencyDesc(phase, require_full=True)
-            scratch_desc = OutputTilingDesc(start_indices=(scratch_start, ),
-                                            tile_sizes=(num_local_pes * kernel_config.BLOCK_SIZE, ))
-            signal_desc = OutputTilingDesc(start_indices=(signal_start, ), tile_sizes=(num_local_pes, ))
             tasks.append(
                 cls._create_task(layer_id, task_id, i, num_tiles, kernel_config, dependency, io_tensors, extra_params,
                                  inputs_dep={
                                      input: input_desc,
                                      phase: phase_desc,
-                                 },
-                                 outs_tile_mapping={
-                                     scratch_out: scratch_desc,
-                                     signal_out: signal_desc,
                                  }))
         return tasks
 
@@ -171,10 +160,10 @@ class AllReduceNVSHMEMTaskBuilder(TaskBuilderBase):
     @classmethod
     def _build_tasks_impl(cls, device_prop, layer_id: int, dependency: TaskDependency, io_tensors, extra_params,
                           tile_wise=True) -> List[TaskBase]:
-        scratch, signal, phase = io_tensors[0]
+        input, scratch, signal, phase = io_tensors[0]
         output = io_tensors[1][0]
         num_elements = output.numel()
-        assert len(output.shape) == 1
+        assert len(input.shape) == 1 and len(output.shape) == 1
         task_id = cls.get_task_id(layer_id)
         kernel_config = cls.create_config()
         num_tiles = cdiv(num_elements, kernel_config.BLOCK_SIZE)
@@ -190,19 +179,14 @@ class AllReduceNVSHMEMTaskBuilder(TaskBuilderBase):
         for i in range(num_tiles):
             tile_start = i * kernel_config.BLOCK_SIZE
             tile_size = min(kernel_config.BLOCK_SIZE, num_elements - tile_start)
-            scratch_start = i * num_local_pes * kernel_config.BLOCK_SIZE
-            signal_start = i * num_local_pes
-            scratch_desc = InputDependencyDesc(scratch, require_full=False, start_indices=(scratch_start, ),
-                                               data_sizes=(num_local_pes * kernel_config.BLOCK_SIZE, ))
-            signal_desc = InputDependencyDesc(signal, require_full=False, start_indices=(signal_start, ),
-                                              data_sizes=(num_local_pes, ))
+            input_desc = InputDependencyDesc(input, require_full=False, start_indices=(tile_start, ),
+                                             data_sizes=(tile_size, ))
             phase_desc = InputDependencyDesc(phase, require_full=True)
             output_desc = OutputTilingDesc(start_indices=(tile_start, ), tile_sizes=(tile_size, ))
             tasks.append(
                 cls._create_task(layer_id, task_id, i, num_tiles, kernel_config, dependency, io_tensors, extra_params,
                                  inputs_dep={
-                                     scratch: scratch_desc,
-                                     signal: signal_desc,
+                                     input: input_desc,
                                      phase: phase_desc,
                                  },
                                  outs_tile_mapping={output: output_desc}))
