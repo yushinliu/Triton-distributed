@@ -50,6 +50,7 @@ def parse_args():
     parser.add_argument("--profile", default=False, action="store_true", help="enable kernel level profiling")
     parser.add_argument("--temperature", default=0.0, type=float)
     parser.add_argument("--top_p", default=0.95, type=float)
+    parser.add_argument("--allreduce_impl", type=str, default="multimem", choices=["multimem", "nvshmem"])
     parser.add_argument("--intra_kernel_profile", default=False, action="store_true",
                         help="enable intra kernel profiling")
 
@@ -75,7 +76,8 @@ if __name__ == "__main__":
                                world_size=WORLD_SIZE, local_only=False)
 
     builder = ModelBuilder(rank=RANK, world_size=WORLD_SIZE, local_world_size=LOCAL_WORLD_SIZE,
-                           enable_profiling=args.intra_kernel_profile)
+                           enable_profiling=args.intra_kernel_profile,
+                           allreduce_implementation=args.allreduce_impl)
     batch_size = args.batch_size
     history = []
     ctx = get_torch_prof_ctx(args.profile)

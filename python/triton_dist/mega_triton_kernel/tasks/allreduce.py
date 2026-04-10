@@ -63,7 +63,9 @@ allreduce_task_compute(task_base_info, scoreboard, BLOCK_SIZE={config.BLOCK_SIZE
 def codegen_allreduce_nvshmem(task: AllReduceNVSHMEMTask) -> str:
     config: AllReduceConfig = task.config
     scratch_tensor = task.io_tensors[0][1]
-    num_local_pes = scratch_tensor.numel() // (task.num_tiles * config.BLOCK_SIZE)
+    signal_tensor = task.io_tensors[0][2]
+    num_local_pes = signal_tensor.numel() // task.num_tiles
+    assert scratch_tensor.numel() == task.num_tiles * config.BLOCK_SIZE * num_local_pes
     code = f"""
 allreduce_nvshmem_task_compute(task_base_info, scoreboard, BLOCK_SIZE={config.BLOCK_SIZE}, NUM_LOCAL_PES={num_local_pes})
 """
@@ -102,7 +104,7 @@ class AllReduceNVSHMEMTaskBuilder(TaskBuilderBase):
     @classmethod
     def _build_tasks_impl(cls, device_prop, layer_id: int, dependency: TaskDependency, io_tensors, extra_params,
                           tile_wise=True) -> List[TaskBase]:
-        input, scratch = io_tensors[0]
+        input, scratch, signal, phase = io_tensors[0]
         output = io_tensors[1][0]
         num_elements = output.numel()
         assert input.shape == output.shape and len(input.shape) == 1
@@ -111,6 +113,8 @@ class AllReduceNVSHMEMTaskBuilder(TaskBuilderBase):
         num_tiles = cdiv(num_elements, kernel_config.BLOCK_SIZE)
         expected_scratch_elems = num_tiles * kernel_config.BLOCK_SIZE
         assert scratch.numel() % expected_scratch_elems == 0
+        assert signal.numel() % num_tiles == 0
+        assert phase.numel() == 1
 
         cls.log(
             f"AllReduceNVSHMEM Task: num_tiles = {num_tiles}, num_elements = {num_elements}, BLOCK_SIZE = {kernel_config.BLOCK_SIZE}, dependency = {dependency}"

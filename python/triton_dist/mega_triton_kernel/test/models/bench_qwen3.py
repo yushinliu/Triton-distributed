@@ -66,6 +66,7 @@ def parse_args():
     parser.add_argument("--warmup", default=10, type=int, help="warmup iterations")
     parser.add_argument("--iters", default=20, type=int, help="perf iterations")
     parser.add_argument("--allreduce_method", type=str, default="one_shot_multimem", choices=get_allreduce_methods())
+    parser.add_argument("--mega_allreduce_impl", type=str, default="multimem", choices=["multimem", "nvshmem"])
 
     return parser.parse_args()
 
@@ -97,7 +98,8 @@ if __name__ == "__main__":
     model_config = ModelConfig(model_name=args.model, max_length=args.seq_len + 4, dtype=dtype, rank=RANK,
                                world_size=WORLD_SIZE, local_only=False)
     # mega kernel
-    builder = ModelBuilder(rank=RANK, world_size=WORLD_SIZE, local_world_size=LOCAL_WORLD_SIZE)
+    builder = ModelBuilder(rank=RANK, world_size=WORLD_SIZE, local_world_size=LOCAL_WORLD_SIZE,
+                           allreduce_implementation=args.mega_allreduce_impl)
     mege_kernel_model = DenseModel(batch_size, model_config, builder, build_lm_head=True)
     mege_kernel_model.kv_cache.inc_offset(seq_len)
 

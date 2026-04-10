@@ -66,8 +66,9 @@ def allreduce_task_compute(
 
 
 @triton_dist.jit
-def allreduce_one_shot_nvshmem_remote_write_intra_node_kernel(pid, symm_in_ptr, symm_scratch_ptr, out_ptr, elems,
-                                                              BLOCK_SIZE: tl.constexpr, NUM_LOCAL_PES: tl.constexpr):
+def allreduce_one_shot_nvshmem_remote_write_intra_node_kernel(pid, symm_in_ptr, symm_scratch_ptr, symm_signal_ptr,
+                                                              phase_ptr, out_ptr, elems, BLOCK_SIZE: tl.constexpr,
+                                                              NUM_LOCAL_PES: tl.constexpr):
     symm_in_ptr = tl.cast(symm_in_ptr, out_ptr.dtype)
     symm_scratch_ptr = tl.cast(symm_scratch_ptr, out_ptr.dtype)
 
@@ -79,8 +80,10 @@ def allreduce_one_shot_nvshmem_remote_write_intra_node_kernel(pid, symm_in_ptr, 
     elem_size = tl.constexpr(out_ptr.dtype.element_ty.primitive_bitwidth) // 8
     input_tile_ptr = symm_in_ptr + tile_start
     scratch_tile_ptr = symm_scratch_ptr + pid * BLOCK_SIZE * NUM_LOCAL_PES
+    signal_tile_ptr = symm_signal_ptr + pid * NUM_LOCAL_PES
     local_pe = libshmem_device.team_my_pe(libshmem_device.NVSHMEMX_TEAM_NODE)
     local_slot_ptr = scratch_tile_ptr + local_pe * BLOCK_SIZE
+    phase = tl.load(phase_ptr)
 
     __syncthreads()
 
@@ -88,19 +91,29 @@ def allreduce_one_shot_nvshmem_remote_write_intra_node_kernel(pid, symm_in_ptr, 
     block_dim = num_warps() * 32
     # Remote-write / local-read protocol:
     # 1. Copy the local tile into the local scratch slot.
-    # 2. Push the same tile to every peer's scratch slot assigned to this PE.
-    # 3. Synchronize across the node team, then reduce from the local scratch buffer.
+    # 2. Push the same tile to every peer's scratch slot assigned to this PE and
+    #    signal completion for this tile only.
+    # 3. Wait for all peers' tile-local signals, then reduce from the local scratch buffer.
     for off in range(0, BLOCK_SIZE, block_dim):
         idx = thread_idx + off
         if idx < valid_elems:
             tl.store(local_slot_ptr + idx, tl.load(input_tile_ptr + idx))
     __syncthreads()
 
+    if thread_idx == 0:
+        tl.store(signal_tile_ptr + local_pe, phase)
+    __syncthreads()
+
     nbytes = valid_elems * elem_size
     for pe in tl.static_range(0, NUM_LOCAL_PES):
         if pe != local_pe:
-            libshmem_device.putmem_block(local_slot_ptr, input_tile_ptr, nbytes, pe)
-    libshmem_device.barrier_block(libshmem_device.NVSHMEMX_TEAM_NODE)
+            peer_global_pe = libshmem_device.team_translate_pe(libshmem_device.NVSHMEMX_TEAM_NODE, pe,
+                                                               libshmem_device.NVSHMEM_TEAM_WORLD)
+            libshmem_device.putmem_signal_block(local_slot_ptr, input_tile_ptr, nbytes, signal_tile_ptr + local_pe,
+                                                phase, libshmem_device.NVSHMEM_SIGNAL_SET, peer_global_pe)
+
+    if thread_idx < NUM_LOCAL_PES:
+        libshmem_device.signal_wait_until(signal_tile_ptr + thread_idx, libshmem_device.NVSHMEM_CMP_EQ, phase)
     __syncthreads()
 
     for off in range(0, BLOCK_SIZE, block_dim):
@@ -122,14 +135,18 @@ def allreduce_nvshmem_task_compute(
 ):
     input_tensor = task_base_info.get_tensor(0)
     scratch_tensor = task_base_info.get_tensor(1)
-    output_tensor = task_base_info.get_tensor(2)
+    signal_tensor = task_base_info.get_tensor(2)
+    phase_tensor = task_base_info.get_tensor(3)
+    output_tensor = task_base_info.get_tensor(4)
 
     input_ptr = input_tensor.data_ptr(tl.bfloat16)
     scratch_ptr = scratch_tensor.data_ptr(tl.bfloat16)
+    signal_ptr = signal_tensor.data_ptr(tl.int64)
+    phase_ptr = phase_tensor.data_ptr(tl.int64)
     output_ptr = output_tensor.data_ptr(tl.bfloat16)
 
     n_elements = output_tensor.size(0)
     tile_id = task_base_info.tile_id_or_start
-    allreduce_one_shot_nvshmem_remote_write_intra_node_kernel(tile_id, input_ptr, scratch_ptr, output_ptr, n_elements,
-                                                              BLOCK_SIZE, NUM_LOCAL_PES)
+    allreduce_one_shot_nvshmem_remote_write_intra_node_kernel(tile_id, input_ptr, scratch_ptr, signal_ptr, phase_ptr,
+                                                              output_ptr, n_elements, BLOCK_SIZE, NUM_LOCAL_PES)
     scoreboard.release_tile(task_base_info, task_base_info.tile_id_or_start)

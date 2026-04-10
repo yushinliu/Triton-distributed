@@ -35,7 +35,7 @@ from ..core.task_base import TaskBase, DeviceProp, TaskDependency, TaskIDManager
 from ..core.builder import TaskBuilderBase
 from ..core.graph import Graph
 from typing import List, Dict, Any
-from triton_dist.utils import nvshmem_create_tensor, nvshmem_free_tensor_sync
+from triton_dist.utils import NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensor, nvshmem_free_tensor_sync
 from ..core.scheduler import enque_tasks
 from triton_dist.models.utils import logger
 from triton_dist.tools.profiler import alloc_profiler_buffer, export_to_perfetto_trace, reset_profiler_buffer, parse_to_tracks
@@ -86,7 +86,8 @@ def check_alignment(tensors):
 class ModelBuilder:
 
     def __init__(self, rank=0, world_size=1, local_world_size=1, num_warps=4, enable_profiling=False,
-                 enable_dep_opt=True, enable_runtime_scheduler=False, enable_mlp_fc1_silu_fusion=False):
+                 enable_dep_opt=True, enable_runtime_scheduler=False, enable_mlp_fc1_silu_fusion=False,
+                 allreduce_implementation="multimem"):
         self.reset()
         self._registry = registry
         self._code_generator = CodeGenerator()
@@ -123,10 +124,12 @@ class ModelBuilder:
         self._enable_dep_opt = enable_dep_opt
         self._enable_runtime_scheduler = enable_runtime_scheduler
         self._enable_mlp_fc1_silu_fusion = enable_mlp_fc1_silu_fusion
+        self._allreduce_implementation = allreduce_implementation
         self._codegen_options = CodeGenOptions(enable_profiling=enable_profiling,
                                                enable_runtime_scheduler=enable_runtime_scheduler)
         self.task_types_to_str = None
         self._graph = Graph()
+        self._run_phase = torch.zeros((1, ), dtype=NVSHMEM_SIGNAL_DTYPE, device=torch.cuda.current_device())
 
     def create_symm_tensor(self, shape, dtype) -> torch.Tensor:
         tensor = nvshmem_create_tensor(shape, dtype)
@@ -519,11 +522,13 @@ class ModelBuilder:
                          [[self.barrier_all_intra_node_buf] + wait_inputs, wait_inputs], extra_params)
 
     def make_allreduce(self, input: torch.Tensor, output: torch.Tensor, double_input_buffer=False, layer_id=0,
-                       implementation="multimem"):
+                       implementation=None):
         """
             if double_input_buffer is True, user needs to ensure that the input of two consecutive allreduce are completely different buffers,
             otherwise, the output may be wrong.
         """
+        if implementation is None:
+            implementation = self._allreduce_implementation
         assert self.world_size > 1
         input = input.reshape(-1)
         output = output.reshape(-1)
@@ -542,13 +547,15 @@ class ModelBuilder:
             num_tiles = (input.numel() + kernel_config.BLOCK_SIZE - 1) // kernel_config.BLOCK_SIZE
             scratch_buf = self.create_symm_tensor((num_tiles * self.local_world_size * kernel_config.BLOCK_SIZE, ),
                                                   input.dtype)
+            signal_buf = self.create_symm_tensor((num_tiles * self.local_world_size, ), NVSHMEM_SIGNAL_DTYPE)
+            signal_buf.zero_()
         else:
             raise ValueError(f"Unsupported allreduce implementation: {implementation}")
         self.make_barrier_all_intra_node(wait_inputs=[input], layer_id=layer_id)
         if implementation == "multimem":
             self._convert_op("allreduce", layer_id, [[input], [output]])
         else:
-            self._convert_op("allreduce_nvshmem", layer_id, [[input, scratch_buf], [output]])
+            self._convert_op("allreduce_nvshmem", layer_id, [[input, scratch_buf, signal_buf, self._run_phase], [output]])
         if not double_input_buffer:
             self.make_barrier_all_intra_node(wait_inputs=[output], layer_id=layer_id)
 
@@ -620,6 +627,7 @@ class ModelBuilder:
         work_queue_start = torch.empty((1, ), dtype=torch.int32, device=torch.cuda.current_device())
         if self._enable_runtime_scheduler:
             work_queue_start.fill_(0)
+        self._run_phase.add_(1)
         if self._enable_profiling:
             assert self.profile_buf is not None
             reset_profiler_buffer(self.profile_buf)
