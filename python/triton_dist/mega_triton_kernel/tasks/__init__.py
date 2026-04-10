@@ -25,7 +25,7 @@
 from .linear import (LinearTaskBuilder, MLPFC1TaskBuilder, MLPFC1SiLUMulUpTaskBuilder,
                      RMSNormMLPFC1SiLUMulUpTaskBuilder, QKVProjTaskBuilder, OProjTaskBuilder, OProjAddTaskBuilder)
 from .activation import SiLUMulUpTaskBuilder
-from .allreduce import AllReduceTaskBuilder, AllReduceNVSHMEMTaskBuilder
+from .allreduce import AllReduceTaskBuilder, AllReduceNVSHMEMPushTaskBuilder, AllReduceNVSHMEMTaskBuilder
 from .flash_decode import AttnSplitTaskBuilder, AttnCombineTaskBuilder
 from .norm import RMSNormTask, QKNormRopeUpdateKVCacheTaskBuilder, QKVPackQKNormRopeSplitVTaskBuilder
 from .elementwise import AddTaskBuilder
@@ -43,6 +43,7 @@ __all__ = [
     "OProjAddTaskBuilder",
     "SiLUMulUpTaskBuilder",
     "AllReduceTaskBuilder",
+    "AllReduceNVSHMEMPushTaskBuilder",
     "AllReduceNVSHMEMTaskBuilder",
     "AttnSplitTaskBuilder",
     "AttnCombineTaskBuilder",

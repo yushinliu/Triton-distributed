@@ -35,7 +35,7 @@ from ..core.task_base import TaskBase, DeviceProp, TaskDependency, TaskIDManager
 from ..core.builder import TaskBuilderBase
 from ..core.graph import Graph
 from typing import List, Dict, Any
-from triton_dist.utils import nvshmem_create_tensor, nvshmem_free_tensor_sync
+from triton_dist.utils import NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensor, nvshmem_free_tensor_sync
 from ..core.scheduler import enque_tasks
 from triton_dist.models.utils import logger
 from triton_dist.tools.profiler import alloc_profiler_buffer, export_to_perfetto_trace, reset_profiler_buffer, parse_to_tracks
@@ -110,6 +110,7 @@ class ModelBuilder:
         assert self.world_size % self.local_world_size == 0
         assert self.world_size > 0 and self.local_world_size > 0
         self.all_symm_tensors = []
+        self.allreduce_phase_tensors = []
         if self.world_size > 1:
             self.barrier_all_intra_node_buf = self.create_symm_tensor([
                 world_size,
@@ -542,13 +543,19 @@ class ModelBuilder:
             num_tiles = (input.numel() + kernel_config.BLOCK_SIZE - 1) // kernel_config.BLOCK_SIZE
             scratch_buf = self.create_symm_tensor((num_tiles * self.local_world_size * kernel_config.BLOCK_SIZE, ),
                                                   input.dtype)
+            signal_buf = self.create_symm_tensor((num_tiles * self.local_world_size, ), NVSHMEM_SIGNAL_DTYPE)
+            signal_buf.zero_()
+            phase_buf = torch.zeros((1, ), dtype=NVSHMEM_SIGNAL_DTYPE, device=torch.cuda.current_device())
+            self.allreduce_phase_tensors.append(phase_buf)
         else:
             raise ValueError(f"Unsupported allreduce implementation: {implementation}")
         self.make_barrier_all_intra_node(wait_inputs=[input], layer_id=layer_id)
         if implementation == "multimem":
             self._convert_op("allreduce", layer_id, [[input], [output]])
         else:
-            self._convert_op("allreduce_nvshmem", layer_id, [[input, scratch_buf], [output]])
+            self._convert_op("allreduce_nvshmem_push", layer_id, [[input, scratch_buf, signal_buf, phase_buf],
+                                                                  [scratch_buf, signal_buf]])
+            self._convert_op("allreduce_nvshmem", layer_id, [[scratch_buf, signal_buf, phase_buf], [output]])
         if not double_input_buffer:
             self.make_barrier_all_intra_node(wait_inputs=[output], layer_id=layer_id)
 
@@ -620,6 +627,8 @@ class ModelBuilder:
         work_queue_start = torch.empty((1, ), dtype=torch.int32, device=torch.cuda.current_device())
         if self._enable_runtime_scheduler:
             work_queue_start.fill_(0)
+        for phase_tensor in self.allreduce_phase_tensors:
+            phase_tensor.add_(1)
         if self._enable_profiling:
             assert self.profile_buf is not None
             reset_profiler_buffer(self.profile_buf)
