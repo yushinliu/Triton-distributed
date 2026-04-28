@@ -23,7 +23,11 @@
 #
 ################################################################################
 
-from transformers import AutoTokenizer as HFTokenizer
+try:
+    from transformers import AutoTokenizer as HFTokenizer
+except ImportError as e:
+    HFTokenizer = None
+    _tokenizer_import_error = e
 
 from .config import ModelConfig
 
@@ -94,5 +98,7 @@ class AutoTokenizer:
 
     @staticmethod
     def from_pretrained(model_config):
+        if HFTokenizer is None:
+            raise ImportError("AutoTokenizer requires the optional transformers dependency.") from _tokenizer_import_error
         return HFTokenizer.from_pretrained(model_config.model_name, use_fast=True, legacy=False,
                                            local_files_only=model_config.local_only)

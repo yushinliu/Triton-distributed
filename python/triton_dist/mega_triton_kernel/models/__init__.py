@@ -23,7 +23,11 @@
 #
 ################################################################################
 from .model_builder import ModelBuilder
-from .dense import DenseModel
+
+try:
+    from .dense import DenseModel
+except ImportError:
+    DenseModel = None
 
 __all__ = [
     "ModelBuilder",

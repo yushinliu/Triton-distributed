@@ -52,6 +52,7 @@ def make_mega_kernel_src(tasks_dispatch_code: str, task_types_and_str: Dict[int,
     enable_profiling = codegen_options.enable_profiling
     enalbe_task_prefetch = codegen_options.enalbe_task_prefetch
     enable_runtime_scheduler = codegen_options.enable_runtime_scheduler
+    profiler_import = "from triton_dist.tools.profiler import Profiler" if enable_profiling else ""
 
     src = f"""
 import triton
@@ -60,7 +61,7 @@ import triton.language as tl
 from triton_dist.mega_triton_kernel.kernels import *
 
 from triton_dist.mega_triton_kernel.kernels.task_context import Scoreboard
-from triton_dist.tools.profiler import Profiler
+{profiler_import}
 from triton_dist.language.extra.language_extra import tid
 
 @triton_dist.jit

@@ -113,29 +113,26 @@ def allreduce_one_shot_nvshmem_reduce_intra_node_kernel(pid, symm_in_ptr, symm_s
     local_slot_ptr = scratch_tile_ptr + local_pe * BLOCK_SIZE
     signal_value = tl.load(phase_ptr)
 
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < valid_elems
     thread_idx = tid(axis=0)
-    block_dim = num_warps() * 32
-    for off in range(0, BLOCK_SIZE, block_dim):
-        idx = thread_idx + off
-        if idx < valid_elems:
-            tl.store(local_slot_ptr + idx, tl.load(input_tile_ptr + idx))
+    data = tl.load(input_tile_ptr + offsets, mask=mask, other=0.0)
+    tl.store(local_slot_ptr + offsets, data, mask=mask)
     __syncthreads()
 
     if thread_idx == 0:
         st(signal_tile_ptr + local_pe, signal_value, scope="sys", semantic="release")
     __syncthreads()
 
-    if thread_idx < NUM_LOCAL_PES:
-        libshmem_device.signal_wait_until(signal_tile_ptr + thread_idx, libshmem_device.NVSHMEM_CMP_EQ, signal_value)
+    if thread_idx == 0:
+        for pe in tl.static_range(0, NUM_LOCAL_PES):
+            libshmem_device.signal_wait_until(signal_tile_ptr + pe, libshmem_device.NVSHMEM_CMP_EQ, signal_value)
     __syncthreads()
 
-    for off in range(0, BLOCK_SIZE, block_dim):
-        idx = thread_idx + off
-        if idx < valid_elems:
-            acc = tl.zeros((), dtype=tl.float32)
-            for pe in tl.static_range(0, NUM_LOCAL_PES):
-                acc += tl.load(scratch_tile_ptr + pe * BLOCK_SIZE + idx).to(tl.float32)
-            tl.store(out_ptr + tile_start + idx, acc.to(out_ptr.dtype.element_ty))
+    acc = tl.zeros((BLOCK_SIZE, ), dtype=tl.float32)
+    for pe in tl.static_range(0, NUM_LOCAL_PES):
+        acc += tl.load(scratch_tile_ptr + pe * BLOCK_SIZE + offsets, mask=mask, other=0.0).to(tl.float32)
+    tl.store(out_ptr + tile_start + offsets, acc.to(out_ptr.dtype.element_ty), mask=mask)
     __syncthreads()
 
 

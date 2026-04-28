@@ -38,7 +38,6 @@ from typing import List, Dict, Any
 from triton_dist.utils import NVSHMEM_SIGNAL_DTYPE, nvshmem_create_tensor, nvshmem_free_tensor_sync
 from ..core.scheduler import enque_tasks
 from triton_dist.models.utils import logger
-from triton_dist.tools.profiler import alloc_profiler_buffer, export_to_perfetto_trace, reset_profiler_buffer, parse_to_tracks
 
 
 def is_multicast_ptr(tensor):
@@ -176,6 +175,8 @@ class ModelBuilder:
 
     def get_sm_activity(self):
         assert self._enable_profiling
+        from triton_dist.tools.profiler import parse_to_tracks
+
         block_idx_to_tracks = parse_to_tracks(self.profile_buf)
         sb_wait_deps_task_type = None
         for k, v in self.task_types_to_str.items():
@@ -647,12 +648,16 @@ class ModelBuilder:
         max_num_profile_slots = (self.wq_tensor.shape[0] + 4) * self.device_prop.NUM_SMS * 4
         self.logger.log(f"max_num_profile_slots = {max_num_profile_slots}", level="debug")
         if self._enable_profiling:
+            from triton_dist.tools.profiler import alloc_profiler_buffer
+
             self.profile_buf = alloc_profiler_buffer(max_num_profile_slots)
         else:
             self.profile_buf = None
 
     def dump_trace(self, trace_file_prefix="MEGA_KERNEL_TRACE"):
         if self._enable_profiling:
+            from triton_dist.tools.profiler import export_to_perfetto_trace
+
             profiler_dir = os.environ.get("MEGA_KERNEL_PRODILER_DIR", "./prof")
             os.makedirs(profiler_dir, exist_ok=True)
             trace_file = os.path.join(profiler_dir, f"{trace_file_prefix}_RANK_{self.rank}")
@@ -668,6 +673,8 @@ class ModelBuilder:
         for phase_tensor in self.allreduce_phase_tensors:
             phase_tensor.add_(1)
         if self._enable_profiling:
+            from triton_dist.tools.profiler import reset_profiler_buffer
+
             assert self.profile_buf is not None
             reset_profiler_buffer(self.profile_buf)
             self._gen_kernel[grid](
