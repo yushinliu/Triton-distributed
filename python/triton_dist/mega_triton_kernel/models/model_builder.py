@@ -173,6 +173,138 @@ class ModelBuilder:
                 interleaved.append(second_tasks[idx])
         return interleaved
 
+    @staticmethod
+    def _has_task_data_dependency(consumer_task: TaskBase, producer_task: TaskBase, producer_out_idx: int = 0,
+                                  consumer_input_idx: int = 0) -> bool:
+        input_dep_desc = consumer_task.get_input_dep_desc(consumer_input_idx)
+        out_tiling_desc = producer_task.get_out_tiling_desc(producer_out_idx)
+        if input_dep_desc is None or out_tiling_desc is None:
+            return True
+        if input_dep_desc.require_full:
+            return True
+
+        consumer_shape = input_dep_desc.input.shape
+        producer_shape = producer_task.io_tensors[1][producer_out_idx].shape
+        if (len(consumer_shape) == 1 and len(producer_shape) == 2 and len(input_dep_desc.start_indices) == 1
+                and len(out_tiling_desc.start_indices) == 2 and out_tiling_desc.tile_sizes is not None):
+            flat_start = input_dep_desc.start_indices[0]
+            flat_end = min(flat_start + input_dep_desc.data_sizes[0], consumer_shape[0])
+            if flat_start >= flat_end:
+                return False
+
+            rows, cols = producer_shape
+            row_start, col_start = out_tiling_desc.start_indices
+            tile_rows, tile_cols = out_tiling_desc.tile_sizes
+            row_end = min(row_start + tile_rows, rows)
+            col_end = min(col_start + tile_cols, cols)
+            if row_start >= row_end or col_start >= col_end:
+                return False
+
+            flat_row_start = flat_start // cols
+            flat_row_end = (flat_end - 1) // cols + 1
+            for row in range(max(row_start, flat_row_start), min(row_end, flat_row_end)):
+                row_flat_start = max(flat_start, row * cols)
+                row_flat_end = min(flat_end, (row + 1) * cols)
+                flat_col_start = row_flat_start - row * cols
+                flat_col_end = row_flat_end - row * cols
+                if max(flat_col_start, col_start) < min(flat_col_end, col_end):
+                    return True
+            return False
+
+        return consumer_task.has_data_dependency(producer_task, producer_out_idx, consumer_input_idx)
+
+    def _interleave_producer_with_allreduce_tasks(self, producer_tasks: List[TaskBase], local_tasks: List[TaskBase],
+                                                  push_tasks: List[TaskBase]) -> List[TaskBase]:
+        if len(producer_tasks) == 0 or len(local_tasks) == 0:
+            return self._interleave_tasks(local_tasks, push_tasks)
+
+        ready_items = []
+        for local_task in local_tasks:
+            max_producer_idx = -1
+            has_dependency = False
+            for idx, producer_task in enumerate(producer_tasks):
+                if self._has_task_data_dependency(local_task, producer_task):
+                    has_dependency = True
+                    max_producer_idx = max(max_producer_idx, idx)
+            if not has_dependency:
+                max_producer_idx = len(producer_tasks) - 1
+            ready_items.append((max_producer_idx, local_task.tile_id_or_start, local_task))
+        ready_items.sort(key=lambda item: (item[0], item[1]))
+
+        def read_positive_int_env(name: str, default: int) -> int:
+            try:
+                return max(1, int(os.getenv(name, str(default))))
+            except ValueError:
+                return default
+
+        producer_chunk = read_positive_int_env("MEGA_KERNEL_NVSHMEM_INTERLEAVE_PRODUCER_CHUNK", 16)
+        ar_tiles_per_flush = read_positive_int_env("MEGA_KERNEL_NVSHMEM_INTERLEAVE_AR_TILES", 1)
+        push_by_tile = {task.tile_id_or_start: task for task in push_tasks}
+        emitted_push_ids = set()
+        interleaved = []
+        ready_idx = 0
+        for producer_idx, producer_task in enumerate(producer_tasks):
+            interleaved.append(producer_task)
+            should_flush = ((producer_idx + 1) % producer_chunk == 0 or producer_idx == len(producer_tasks) - 1)
+            if not should_flush:
+                continue
+
+            emitted_ar_tiles = 0
+            while (ready_idx < len(ready_items) and ready_items[ready_idx][0] <= producer_idx
+                   and emitted_ar_tiles < ar_tiles_per_flush):
+                _, tile_id, local_task = ready_items[ready_idx]
+                interleaved.append(local_task)
+                push_task = push_by_tile.get(tile_id)
+                if push_task is not None:
+                    interleaved.append(push_task)
+                    emitted_push_ids.add(id(push_task))
+                ready_idx += 1
+                emitted_ar_tiles += 1
+
+        while ready_idx < len(ready_items):
+            _, tile_id, local_task = ready_items[ready_idx]
+            interleaved.append(local_task)
+            push_task = push_by_tile.get(tile_id)
+            if push_task is not None:
+                interleaved.append(push_task)
+                emitted_push_ids.add(id(push_task))
+            ready_idx += 1
+        for push_task in push_tasks:
+            if id(push_task) not in emitted_push_ids:
+                interleaved.append(push_task)
+        return interleaved
+
+    def _interleave_recent_producer_with_allreduce_tasks(self, producer_dependency: TaskDependency,
+                                                         local_tasks: List[TaskBase], push_tasks: List[TaskBase]):
+        num_allreduce_tasks = len(local_tasks) + len(push_tasks)
+        allreduce_start = len(self.megakernel_tasks) - num_allreduce_tasks
+        if producer_dependency.layer_id < 0 or producer_dependency.task_id < 0 or allreduce_start <= 0:
+            self.megakernel_tasks[-num_allreduce_tasks:] = self._interleave_tasks(local_tasks, push_tasks)
+            return
+
+        producer_indices = [
+            idx for idx, task in enumerate(self.megakernel_tasks[:allreduce_start])
+            if task.layer_id == producer_dependency.layer_id and task.task_id == producer_dependency.task_id
+        ]
+        if len(producer_indices) == 0:
+            self.megakernel_tasks[-num_allreduce_tasks:] = self._interleave_tasks(local_tasks, push_tasks)
+            return
+
+        producer_start = producer_indices[0]
+        producer_end = producer_indices[-1] + 1
+        is_contiguous = producer_indices == list(range(producer_start, producer_end))
+        if not is_contiguous or producer_end != allreduce_start:
+            self.megakernel_tasks[-num_allreduce_tasks:] = self._interleave_tasks(local_tasks, push_tasks)
+            return
+
+        producer_tasks = self.megakernel_tasks[producer_start:producer_end]
+        interleaved = self._interleave_producer_with_allreduce_tasks(producer_tasks, local_tasks, push_tasks)
+        self.megakernel_tasks = self.megakernel_tasks[:producer_start] + interleaved
+        self.logger.log(
+            f"interleaved {len(producer_tasks)} producer tasks with {len(local_tasks)} local and "
+            f"{len(push_tasks)} push NVSHMEM allreduce tasks",
+            level="debug")
+
     def get_sm_activity(self):
         assert self._enable_profiling
         from triton_dist.tools.profiler import parse_to_tracks
@@ -552,6 +684,7 @@ class ModelBuilder:
         elif implementation == "nvshmem":
             if self._enable_runtime_scheduler:
                 raise ValueError("NVSHMEM allreduce overlap path does not support enable_runtime_scheduler=True")
+            producer_dependency = self.last_dependency
             builder_cls = self.get_task_builder("allreduce_nvshmem")
             kernel_config = builder_cls.create_config()
             num_tiles = (input.numel() + kernel_config.BLOCK_SIZE - 1) // kernel_config.BLOCK_SIZE
@@ -563,10 +696,11 @@ class ModelBuilder:
             self.allreduce_phase_tensors.append(phase_buf)
         else:
             raise ValueError(f"Unsupported allreduce implementation: {implementation}")
-        self.make_barrier_all_intra_node(wait_inputs=[input], layer_id=layer_id)
         if implementation == "multimem":
+            self.make_barrier_all_intra_node(wait_inputs=[input], layer_id=layer_id)
             self._convert_op("allreduce", layer_id, [[input], [output]])
         else:
+            # NVSHMEM uses per-tile phase/signal buffers, so it does not need a full-rank arrival barrier here.
             local_io_tensors = [[input, scratch_buf, signal_buf, phase_buf], [output]]
             push_io_tensors = [[input, scratch_buf, signal_buf, phase_buf], []]
             local_builder_cls = self.get_task_builder("allreduce_nvshmem")
@@ -593,8 +727,7 @@ class ModelBuilder:
                                  io_tensors=push_io_tensors,
                                  extra_params={})
             self._update_metrics("allreduce_nvshmem_push", push_io_tensors)
-            num_allreduce_tasks = len(local_tasks) + len(push_tasks)
-            self.megakernel_tasks[-num_allreduce_tasks:] = self._interleave_tasks(local_tasks, push_tasks)
+            self._interleave_recent_producer_with_allreduce_tasks(producer_dependency, local_tasks, push_tasks)
         if not double_input_buffer:
             self.make_barrier_all_intra_node(wait_inputs=[output], layer_id=layer_id)
 

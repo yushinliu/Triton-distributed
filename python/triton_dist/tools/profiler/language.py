@@ -26,7 +26,7 @@ import triton
 import triton.language as tl
 from triton.language.core import to_tensor
 
-from triton_dist.kernels.common_ops import globaltimer_lo, smid, fence, pack_b32_v2
+from triton_dist.kernels.common_ops import globaltimer_lo, smid, pack_b32_v2
 
 NUM_BITS_ID = 20  # global_id = block_id * num_blocks + group_id
 NUM_BITS_TASK_TYPE = 11
@@ -119,10 +119,10 @@ class Profiler:
     @triton.jit
     def record(self, is_start, task_type):
         if self.ENABLE_PROFILING:
-            fence(semantic="sc", scope="cta")
+            tl.debug_barrier()
             if self.is_leader:
                 entry = self.get_profile_entry(is_start, task_type)
                 tl.store(self.buffer, entry)
             self.buffer += self.stride
-            fence(semantic="sc", scope="cta")
+            tl.debug_barrier()
         return self

@@ -25,6 +25,7 @@
 import argparse
 import os
 import subprocess
+from collections import defaultdict
 from types import SimpleNamespace
 
 import torch
@@ -45,6 +46,10 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fuse_fc1_silu", default=False, action="store_true")
     parser.add_argument("--perf", default=False, action="store_true", help="benchmark torch+cudagraph and mega+cudagraph")
+    parser.add_argument("--intra_kernel_profile", default=False, action="store_true",
+                        help="enable mega-kernel per-task profiling")
+    parser.add_argument("--trace_prefix", type=str, default="TP_MLP_NVSHMEM_TRACE",
+                        help="trace file prefix used by --intra_kernel_profile")
     parser.add_argument("--bench_warmup", type=int, default=20)
     parser.add_argument("--bench_iters", type=int, default=100)
     parser.add_argument("--check_atol", type=float, default=5e-2)
@@ -68,8 +73,8 @@ def check_args(args, world_size, local_world_size):
         raise ValueError(
             f"--intermediate_size must be divisible by WORLD_SIZE={world_size}, got {args.intermediate_size}"
         )
-    if args.perf and world_size not in (4, 8):
-        raise ValueError(f"--perf currently supports 4-card and 8-card runs, got WORLD_SIZE={world_size}")
+    if args.perf and world_size not in (2, 4, 8):
+        raise ValueError(f"--perf currently supports 2-card, 4-card and 8-card runs, got WORLD_SIZE={world_size}")
     if args.perf and args.bench_warmup <= 0:
         raise ValueError(f"--bench_warmup must be positive, got {args.bench_warmup}")
     if args.perf and args.bench_iters <= 0:
@@ -281,6 +286,134 @@ def run_perf_benchmark(args, x, out, builder, tp_mlp, group, rank, local_world_s
         print(f"  torch_rank_ms={','.join(f'{ms:.4f}' for ms in torch_rank_times)}")
 
 
+def merge_intervals(intervals):
+    if not intervals:
+        return []
+    merged = []
+    for start, end in sorted(intervals):
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return [(start, end) for start, end in merged]
+
+
+def interval_total(intervals):
+    return sum(end - start for start, end in merge_intervals(intervals))
+
+
+def interval_overlap(lhs, rhs):
+    lhs = merge_intervals(lhs)
+    rhs = merge_intervals(rhs)
+    i = j = 0
+    total = 0
+    while i < len(lhs) and j < len(rhs):
+        start = max(lhs[i][0], rhs[j][0])
+        end = min(lhs[i][1], rhs[j][1])
+        if start < end:
+            total += end - start
+        if lhs[i][1] <= rhs[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
+def percentile(values, pct):
+    if not values:
+        return 0
+    values = sorted(values)
+    idx = int(round((len(values) - 1) * pct / 100.0))
+    return values[idx]
+
+
+def summarize_intra_kernel_profile(builder, group, rank):
+    from triton_dist.tools.profiler import parse_to_tracks
+
+    torch.cuda.synchronize()
+    block_idx_to_tracks = parse_to_tracks(builder.profile_buf)
+    task_names = builder.task_types_to_str
+    intervals_by_name = defaultdict(list)
+    durations_by_name = defaultdict(list)
+    block_durations = defaultdict(int)
+    global_start = None
+    global_end = None
+
+    for block_idx, tracks in block_idx_to_tracks.items():
+        for track in tracks:
+            name = task_names[track.task_type]
+            start = int(track.start_time)
+            end = int(track.start_time + track.duration)
+            intervals_by_name[name].append((start, end))
+            durations_by_name[name].append(int(track.duration))
+            block_durations[block_idx] += int(track.duration)
+            global_start = start if global_start is None else min(global_start, start)
+            global_end = end if global_end is None else max(global_end, end)
+
+    fc2_intervals = intervals_by_name.get("MLPFC2Task", [])
+    ar_intervals = intervals_by_name.get("AllReduceNVSHMEMTask", []) + intervals_by_name.get(
+        "AllReduceNVSHMEMPushTask", [])
+    ar_local_intervals = intervals_by_name.get("AllReduceNVSHMEMTask", [])
+    ar_push_intervals = intervals_by_name.get("AllReduceNVSHMEMPushTask", [])
+
+    e2e_ns = 0 if global_start is None else global_end - global_start
+    ar_union_ns = interval_total(ar_intervals)
+    ar_local_union_ns = interval_total(ar_local_intervals)
+    ar_push_union_ns = interval_total(ar_push_intervals)
+    fc2_union_ns = interval_total(fc2_intervals)
+    ar_fc2_overlap_ns = interval_overlap(fc2_intervals, ar_intervals)
+    local_push_overlap_ns = interval_overlap(ar_local_intervals, ar_push_intervals)
+    local_push_union_ns = interval_total(ar_local_intervals + ar_push_intervals)
+
+    task_summary = []
+    for name, durations in sorted(durations_by_name.items()):
+        intervals = intervals_by_name[name]
+        task_summary.append({
+            "name": name,
+            "count": len(durations),
+            "sum_ms": sum(durations) / 1e6,
+            "avg_us": sum(durations) / len(durations) / 1e3,
+            "p50_us": percentile(durations, 50) / 1e3,
+            "p95_us": percentile(durations, 95) / 1e3,
+            "union_ms": interval_total(intervals) / 1e6,
+        })
+
+    summary = {
+        "rank": rank,
+        "e2e_ms": e2e_ns / 1e6,
+        "max_block_sum_ms": (max(block_durations.values()) if block_durations else 0) / 1e6,
+        "fc2_union_ms": fc2_union_ns / 1e6,
+        "ar_union_ms": ar_union_ns / 1e6,
+        "ar_local_union_ms": ar_local_union_ns / 1e6,
+        "ar_push_union_ms": ar_push_union_ns / 1e6,
+        "ar_fc2_overlap_ms": ar_fc2_overlap_ns / 1e6,
+        "ar_fc2_overlap_ratio": 0.0 if ar_union_ns == 0 else ar_fc2_overlap_ns / ar_union_ns,
+        "local_push_overlap_ms": local_push_overlap_ns / 1e6,
+        "local_push_overlap_ratio": 0.0 if local_push_union_ns == 0 else local_push_overlap_ns / local_push_union_ns,
+        "tasks": task_summary,
+    }
+
+    summaries = [None for _ in range(dist.get_world_size(group))]
+    dist.all_gather_object(summaries, summary, group=group)
+    if rank == 0:
+        print("TP MLP intra-kernel profile summary:")
+        for item in summaries:
+            print(
+                f"  rank={item['rank']} e2e_ms={item['e2e_ms']:.4f} max_block_sum_ms={item['max_block_sum_ms']:.4f} "
+                f"fc2_union_ms={item['fc2_union_ms']:.4f} ar_union_ms={item['ar_union_ms']:.4f} "
+                f"ar_fc2_overlap_ms={item['ar_fc2_overlap_ms']:.4f} "
+                f"ar_fc2_overlap_ratio={item['ar_fc2_overlap_ratio']:.3f} "
+                f"local_push_overlap_ms={item['local_push_overlap_ms']:.4f} "
+                f"local_push_overlap_ratio={item['local_push_overlap_ratio']:.3f}"
+            )
+            for task in item["tasks"]:
+                print(
+                    f"    task={task['name']} count={task['count']} sum_ms={task['sum_ms']:.4f} "
+                    f"union_ms={task['union_ms']:.4f} avg_us={task['avg_us']:.2f} "
+                    f"p50_us={task['p50_us']:.2f} p95_us={task['p95_us']:.2f}"
+                )
+
+
 if __name__ == "__main__":
     args = parse_args()
 
@@ -300,6 +433,7 @@ if __name__ == "__main__":
         rank=RANK,
         world_size=WORLD_SIZE,
         local_world_size=LOCAL_WORLD_SIZE,
+        enable_profiling=args.intra_kernel_profile,
         enable_mlp_fc1_silu_fusion=args.fuse_fc1_silu,
     )
     tp_mlp = TPMLPBuilder(builder=builder, rank=RANK, world_size=WORLD_SIZE, group=TP_GROUP)
@@ -313,6 +447,9 @@ if __name__ == "__main__":
     for iter_idx in range(args.iters):
         local_input = broadcast_randn(x.shape, dtype, TP_GROUP, scale=0.2)
         x.copy_(local_input)
+        if args.intra_kernel_profile:
+            torch.cuda.synchronize()
+            dist.barrier(group=TP_GROUP)
         builder.run()
         mega_out = out.clone()
         torch_out = torch_tp_mlp_ref(local_input, tp_mlp.gate_up_proj, tp_mlp.down_proj, TP_GROUP)
@@ -329,6 +466,14 @@ if __name__ == "__main__":
             f"fuse_fc1_silu={args.fuse_fc1_silu}, "
             f"check_atol={args.check_atol}, check_rtol={args.check_rtol}"
         )
+
+    if args.intra_kernel_profile:
+        summarize_intra_kernel_profile(builder, TP_GROUP, RANK)
+        try:
+            builder.dump_trace(args.trace_prefix)
+        except ModuleNotFoundError as e:
+            if RANK == 0:
+                print(f"Skipping Perfetto trace export because an optional dependency is missing: {e}")
 
     if args.perf:
         run_perf_benchmark(args, x, out, builder, tp_mlp, TP_GROUP, RANK, LOCAL_WORLD_SIZE)

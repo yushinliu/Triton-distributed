@@ -92,8 +92,10 @@ class TPMLPBuilder:
         batch_size, seq_len, hidden_size = x.shape
         num_tokens = batch_size * seq_len
         x = x.reshape(-1, hidden_size)
-        fc1_output = torch.empty(num_tokens, self.gate_up_proj.shape[0], dtype=x.dtype,
-                                 device=x.device) if fc1_output is None else fc1_output
+        use_fused_fc1_silu = getattr(self._builder, "_enable_mlp_fc1_silu_fusion", False) and fc1_output is None
+        if not use_fused_fc1_silu:
+            fc1_output = torch.empty(num_tokens, self.gate_up_proj.shape[0], dtype=x.dtype,
+                                     device=x.device) if fc1_output is None else fc1_output
         act_out = torch.empty(num_tokens, self.gate_up_proj.shape[0] //
                               2, dtype=x.dtype, device=x.device) if act_out is None else act_out
         if self.world_size > 1:
@@ -104,7 +106,6 @@ class TPMLPBuilder:
             assert ar_out is None
             fc2_out = torch.empty(num_tokens, hidden_size, dtype=x.dtype,
                                   device=x.device) if fc2_out is None else fc2_out
-        use_fused_fc1_silu = getattr(self._builder, "_enable_mlp_fc1_silu_fusion", False) and fc1_output is None
         if use_fused_fc1_silu:
             self._builder.make_fused_fc1_silu_mul_up(x, self.gate_up_proj, act_out)
         else:
