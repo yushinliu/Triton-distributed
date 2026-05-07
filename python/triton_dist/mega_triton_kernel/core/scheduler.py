@@ -26,6 +26,7 @@ import torch
 
 from enum import Enum
 import copy
+import dataclasses
 
 
 class SchedulingStrategy(Enum):
@@ -100,6 +101,80 @@ def work_queue_list_to_device_tensor(sm_wq_list):
     return wq_tensor, num_tasks_tensor, scoreboard, task_deps_tensor
 
 
+def _task_config_to_dict(task):
+    config = task.config
+    if dataclasses.is_dataclass(config):
+        return dataclasses.asdict(config)
+    return dict(getattr(config, "__dict__", {}))
+
+
+def _dependency_to_dict(dep, dependency_entry_index, producer_task_names):
+    producer_key = (dep.layer_id, dep.task_id)
+    return {
+        "dependency_entry_index": dependency_entry_index,
+        "producer_layer_id": dep.layer_id,
+        "producer_task_id": dep.task_id,
+        "producer_task_type": producer_task_names.get(producer_key),
+        "producer_tile_start": dep.start_tiles,
+        "producer_tile_end": dep.end_tiles,
+    }
+
+
+def work_queue_list_to_trace_metadata(sm_wq_list):
+    producer_task_names = {}
+    for queue in sm_wq_list:
+        for task in queue:
+            producer_task_names[(task.layer_id, task.task_id)] = type(task).__name__
+
+    dep_entry_idx = 0
+    queues = []
+    for block_idx, queue in enumerate(sm_wq_list):
+        queue_tasks = []
+        for queue_idx, task in enumerate(queue):
+            dependencies = task.dependency if isinstance(task.dependency, (tuple, list)) else [task.dependency]
+            deps_entry_start = dep_entry_idx
+            dep_dicts = []
+            for dep in dependencies:
+                dep_dicts.append(_dependency_to_dict(dep, dep_entry_idx, producer_task_names))
+                dep_entry_idx += 1
+            deps_entry_end = dep_entry_idx
+
+            task_type_name = type(task).__name__
+            queue_tasks.append({
+                "queue_index": queue_idx,
+                "task_event_name": f"{task_type_name}:{block_idx}",
+                "wait_event_name": f"scoreboard_wait_deps:{block_idx}" if deps_entry_start < deps_entry_end else None,
+                "task_type_id": task.get_task_type_id(),
+                "task_type": task_type_name,
+                "layer_id": task.layer_id,
+                "task_id": task.task_id,
+                "tile_id_or_start": task.tile_id_or_start,
+                "num_tiles": task.num_tiles,
+                "config": _task_config_to_dict(task),
+                "deps_entry_start": deps_entry_start,
+                "deps_entry_end": deps_entry_end,
+                "dependencies": dep_dicts,
+            })
+        queues.append({
+            "block_idx": block_idx,
+            "static_queue_sm_id": block_idx,
+            "num_tasks": len(queue),
+            "tasks": queue_tasks,
+        })
+
+    return {
+        "schema_version": 1,
+        "num_blocks": len(sm_wq_list),
+        "num_dependency_entries": dep_entry_idx,
+        "queues": queues,
+        "notes": [
+            "Perfetto event suffix after ':' is block_idx, not a dependency id.",
+            "For a scoreboard_wait_deps:<block_idx> event, match it to the next non-wait task on the same Perfetto track; then use that task's dependencies here.",
+            "deps_entry_start/end are the encoded dependency-entry range consumed by Scoreboard.wait_deps for that task.",
+        ],
+    }
+
+
 def round_robin_scheduler(num_sms, megakernel_tasks):
     sm_wq_list = [[] for i in range(num_sms)]
     for idx, task in enumerate(megakernel_tasks):
@@ -155,7 +230,7 @@ def task_dependency_opt(sm_wq_list):
 
 
 def enque_tasks(num_sms, megakernel_tasks, strategy: SchedulingStrategy = SchedulingStrategy.ROUND_ROBIN,
-                enable_dependency_opt=True):
+                enable_dependency_opt=True, return_trace_metadata=False):
 
     if strategy == SchedulingStrategy.ROUND_ROBIN:
         sm_wq_list = round_robin_scheduler(num_sms, megakernel_tasks)
@@ -165,4 +240,8 @@ def enque_tasks(num_sms, megakernel_tasks, strategy: SchedulingStrategy = Schedu
         raise NotImplementedError(f"Unsupport strategy {strategy}")
     if enable_dependency_opt:
         sm_wq_list = task_dependency_opt(sm_wq_list)
-    return work_queue_list_to_device_tensor(sm_wq_list)
+    trace_metadata = work_queue_list_to_trace_metadata(sm_wq_list) if return_trace_metadata else None
+    tensors = work_queue_list_to_device_tensor(sm_wq_list)
+    if return_trace_metadata:
+        return tensors + (trace_metadata, )
+    return tensors

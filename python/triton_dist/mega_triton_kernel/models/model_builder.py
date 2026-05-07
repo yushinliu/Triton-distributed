@@ -26,6 +26,8 @@ import torch
 import importlib
 import tempfile
 import os
+import json
+import copy
 import nvshmem
 import nvshmem.core
 
@@ -126,6 +128,7 @@ class ModelBuilder:
         self._codegen_options = CodeGenOptions(enable_profiling=enable_profiling,
                                                enable_runtime_scheduler=enable_runtime_scheduler)
         self.task_types_to_str = None
+        self.trace_dependency_metadata = None
         self._graph = Graph()
 
     def create_symm_tensor(self, shape, dtype) -> torch.Tensor:
@@ -761,8 +764,12 @@ class ModelBuilder:
             num_sms = 1
         else:
             num_sms = self.device_prop.NUM_SMS
-        self.wq_tensor, self.num_tasks_tensor, self.scoreboard, self.task_deps_tensor = enque_tasks(
-            num_sms, megakernel_tasks, "round_robin", enable_dependency_opt=not self._enable_runtime_scheduler)
+        (self.wq_tensor, self.num_tasks_tensor, self.scoreboard, self.task_deps_tensor,
+         self.trace_dependency_metadata) = enque_tasks(num_sms,
+                                                       megakernel_tasks,
+                                                       "round_robin",
+                                                       enable_dependency_opt=not self._enable_runtime_scheduler,
+                                                       return_trace_metadata=True)
         self.scoreboard = torch.zeros((self.max_layer_id + 1, self.max_task_id + 1, self.MAX_NUM_TILES_PER_OP),
                                       dtype=torch.int32, device=torch.cuda.current_device())
 
@@ -794,9 +801,30 @@ class ModelBuilder:
             profiler_dir = os.environ.get("MEGA_KERNEL_PRODILER_DIR", "./prof")
             os.makedirs(profiler_dir, exist_ok=True)
             trace_file = os.path.join(profiler_dir, f"{trace_file_prefix}_RANK_{self.rank}")
-            export_to_perfetto_trace(self.profile_buf, self.task_types_to_str, trace_file)
+            self.dump_trace_dependency_map(trace_file)
+            export_to_perfetto_trace(self.profile_buf,
+                                     self.task_types_to_str,
+                                     trace_file,
+                                     dependency_metadata=self.trace_dependency_metadata)
         else:
             self.logger.log("profiler not enabled, please set enable_profiling=True", level="warning")
+
+    def dump_trace_dependency_map(self, trace_file):
+        if self.trace_dependency_metadata is None:
+            return
+        metadata = copy.deepcopy(self.trace_dependency_metadata)
+        metadata.update({
+            "rank": self.rank,
+            "local_rank": self.local_rank,
+            "world_size": self.world_size,
+            "local_world_size": self.local_world_size,
+            "perfetto_trace_file": trace_file if trace_file.endswith(".perfetto-trace") else trace_file + ".perfetto-trace",
+            "task_type_id_to_name": {str(k): v for k, v in self.task_types_to_str.items()},
+            "num_tasks_per_block": self.num_tasks_tensor.detach().cpu().tolist(),
+        })
+        dependency_file = trace_file + ".deps.json"
+        with open(dependency_file, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, sort_keys=True)
 
     def run(self):
         grid = lambda META: (self.device_prop.NUM_SMS, )
