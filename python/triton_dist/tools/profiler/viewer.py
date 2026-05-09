@@ -25,6 +25,7 @@
 
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
+import json
 import os
 import numpy as np
 from .language import (
@@ -411,6 +412,227 @@ def export_to_perfetto_trace(profiler_buffer: torch.Tensor, task_names: List[str
                     close_terminating_flow=close_terminating_flows.get(event_key, []))
 
     tgen.flush()
+
+
+class _ChromeTraceTrackAllocator:
+    """Allocate non-overlapping Chrome trace lanes for each SM track."""
+
+    def __init__(self):
+        self.tracks = defaultdict(list)
+        self.thread_names = {}
+        self.thread_sort_indices = {}
+
+    def choose_track(self, pid, sm_id, ts_start, ts_end):
+        key = (pid, sm_id)
+        lanes = self.tracks[key]
+        for lane_idx, lane in enumerate(lanes):
+            if lane["ts_end"] <= ts_start:
+                lane["ts_end"] = ts_end
+                return lane["tid"]
+
+        lane_idx = len(lanes)
+        tid = int(sm_id) * 1000 + lane_idx
+        lanes.append({
+            "tid": tid,
+            "ts_end": ts_end,
+        })
+        track_name = f"sm_{sm_id}" if lane_idx == 0 else f"sm_{sm_id}.{lane_idx}"
+        self.thread_names[(pid, tid)] = track_name
+        self.thread_sort_indices[(pid, tid)] = int(sm_id) * 1000 + lane_idx
+        return tid
+
+
+def _chrome_ts(timestamp_ns):
+    return timestamp_ns / 1000.0
+
+
+def _add_chrome_metadata_events(trace_events, pid_names, track_allocator):
+    for sort_index, pid in enumerate(sorted(pid_names)):
+        trace_events.append({
+            "name": "process_name",
+            "ph": "M",
+            "pid": pid,
+            "tid": 0,
+            "args": {
+                "name": pid_names[pid],
+            },
+        })
+        trace_events.append({
+            "name": "process_sort_index",
+            "ph": "M",
+            "pid": pid,
+            "tid": 0,
+            "args": {
+                "sort_index": sort_index,
+            },
+        })
+
+    for (pid, tid), track_name in sorted(track_allocator.thread_names.items()):
+        trace_events.append({
+            "name": "thread_name",
+            "ph": "M",
+            "pid": pid,
+            "tid": tid,
+            "args": {
+                "name": track_name,
+            },
+        })
+        trace_events.append({
+            "name": "thread_sort_index",
+            "ph": "M",
+            "pid": pid,
+            "tid": tid,
+            "args": {
+                "sort_index": track_allocator.thread_sort_indices[(pid, tid)],
+            },
+        })
+
+
+def _add_chrome_flow_events(trace_events, event_track_map, event_key, ts_start, ts_end, event_name, open_flows,
+                            close_flows, open_terminating_flows, close_terminating_flows):
+    if event_key not in event_track_map:
+        return
+
+    pid, tid = event_track_map[event_key]
+    for flow_id in open_flows.get(event_key, []):
+        trace_events.append({
+            "name": event_name,
+            "cat": "dependency",
+            "ph": "s",
+            "ts": _chrome_ts(ts_start),
+            "pid": pid,
+            "tid": tid,
+            "id": int(flow_id),
+        })
+    for flow_id in close_flows.get(event_key, []):
+        trace_events.append({
+            "name": event_name,
+            "cat": "dependency",
+            "ph": "s",
+            "ts": _chrome_ts(ts_end),
+            "pid": pid,
+            "tid": tid,
+            "id": int(flow_id),
+        })
+    for flow_id in open_terminating_flows.get(event_key, []):
+        trace_events.append({
+            "name": event_name,
+            "cat": "dependency",
+            "ph": "f",
+            "ts": _chrome_ts(ts_start),
+            "pid": pid,
+            "tid": tid,
+            "id": int(flow_id),
+            "bp": "e",
+        })
+    for flow_id in close_terminating_flows.get(event_key, []):
+        trace_events.append({
+            "name": event_name,
+            "cat": "dependency",
+            "ph": "f",
+            "ts": _chrome_ts(ts_end),
+            "pid": pid,
+            "tid": tid,
+            "id": int(flow_id),
+            "bp": "e",
+        })
+
+
+def export_to_trace(profiler_buffer: torch.Tensor, task_names: List[str], file_name: str,
+                    verbose: bool = False, dependency_metadata: Dict[str, Any] = None) -> None:
+    if not (file_name.endswith(".json") or file_name.endswith(".trace")):
+        file_name = file_name + ".json"
+    assert profiler_buffer.dtype == torch.uint64
+    profiler_buffer_host = profiler_buffer.cpu()
+    num_blocks, num_groups = profiler_buffer_host[:1].view(dtype=torch.int32)
+    num_blocks = int(num_blocks)
+    num_groups = int(num_groups)
+
+    pid_names = {}
+    pid_map = {}
+    track_allocator = _ChromeTraceTrackAllocator()
+    block_idx_to_smid = {}
+
+    profiler_buffer_host = profiler_buffer_host[1:]
+    if num_groups == 1:
+        pid_master = 0
+        pid_names[pid_master] = "tracks of all SMs"
+
+    for i in range(num_blocks):
+        block_idx, sm_id = profiler_buffer_host[i:i + 1].view(dtype=torch.uint32)
+        block_idx, sm_id = int(block_idx), int(sm_id)
+        block_idx_to_smid[block_idx] = sm_id
+        if num_groups > 1:
+            pid = block_idx
+            pid_map[block_idx] = pid
+            pid_names[pid] = f"block_{block_idx}_sm_{sm_id}"
+        else:
+            pid_map[block_idx] = pid_master
+    if verbose:
+        print(f"block_idx_to_smid = {block_idx_to_smid}, {len(block_idx_to_smid)}")
+
+    profiler_buffer_host = profiler_buffer_host[num_blocks:].numpy()
+    records = _verify_and_reorg_tracks(profiler_buffer_host, num_blocks, num_groups)
+    event_map, event_key_by_record = _build_profile_event_map(records, task_names, dependency_metadata)
+    (open_flows, close_flows, open_terminating_flows, close_terminating_flows,
+     flow_count) = _build_dependency_flow_maps(event_map, dependency_metadata)
+    if verbose and dependency_metadata:
+        print(f"dependency flow count = {flow_count}")
+
+    trace_events = []
+    event_track_map = {}
+    event_time_map = {}
+    for block_idx, group_idx, task_type, ts_start, ts_end in records:
+        sm_id = block_idx_to_smid[block_idx]
+        if verbose:
+            print(
+                f'block_idx = {block_idx}, group_idx: {group_idx}, task_type = {task_type}, range =[{ts_start}, {ts_end}]'
+            )
+
+        pid = pid_map[block_idx]
+        tid = track_allocator.choose_track(pid, sm_id, ts_start, ts_end)
+        cur_task_name = _lookup_task_name(task_names, task_type)
+        event_key = event_key_by_record.get((block_idx, group_idx, task_type, ts_start, ts_end))
+        event = event_map.get(event_key)
+        args = _event_debug_annotations(event) if event is not None else {}
+        if args is None:
+            args = {}
+        args.update({
+            "block_idx": block_idx,
+            "group_idx": group_idx,
+            "sm_id": sm_id,
+            "task_type": task_type,
+        })
+        event_name = f"{cur_task_name}:{block_idx}"
+        trace_events.append({
+            "name": event_name,
+            "cat": "triton_dist",
+            "ph": "X",
+            "ts": _chrome_ts(ts_start),
+            "dur": _chrome_ts(ts_end - ts_start),
+            "pid": pid,
+            "tid": tid,
+            "args": args,
+        })
+        if event_key is not None:
+            event_track_map[event_key] = (pid, tid)
+            event_time_map[event_key] = (ts_start, ts_end, event_name)
+
+    for event_key, (ts_start, ts_end, event_name) in event_time_map.items():
+        _add_chrome_flow_events(trace_events, event_track_map, event_key, ts_start, ts_end, event_name, open_flows,
+                                close_flows, open_terminating_flows, close_terminating_flows)
+
+    _add_chrome_metadata_events(trace_events, pid_names, track_allocator)
+    trace = {
+        "traceEvents": trace_events,
+        "displayTimeUnit": "ns",
+        "otherData": {
+            "source": "triton_dist profiler",
+            "timestamp_unit": "us",
+        },
+    }
+    with open(file_name, "w", encoding="utf-8") as f:
+        json.dump(trace, f, indent=2)
 
 
 @dataclass
