@@ -337,6 +337,26 @@ def _build_dependency_flow_maps(event_map, dependency_metadata):
     return open_flows, close_flows, open_terminating_flows, close_terminating_flows, flow_count
 
 
+def _read_profiler_header(profiler_buffer_host: torch.Tensor, verbose: bool = False):
+    num_blocks, num_groups = profiler_buffer_host[:1].view(dtype=torch.int32)
+    num_blocks = int(num_blocks)
+    num_groups = int(num_groups)
+    if num_blocks <= 0:
+        raise ValueError(
+            "Profiler buffer metadata is not initialized: "
+            f"num_blocks={num_blocks}, num_groups={num_groups}. "
+            "Make sure profiling is enabled and the kernel ran before exporting the trace."
+        )
+    if num_groups <= 0:
+        if verbose:
+            print(
+                "Profiler buffer has non-positive num_groups "
+                f"({num_groups}); falling back to the single-group trace layout."
+            )
+        num_groups = 1
+    return num_blocks, num_groups
+
+
 # adapt from flashinfer/flashinfer/profiler/__init__.py
 def export_to_perfetto_trace(profiler_buffer: torch.Tensor, task_names: List[str], file_name: str,
                              verbose: bool = False, dependency_metadata: Dict[str, Any] = None) -> None:
@@ -346,9 +366,7 @@ def export_to_perfetto_trace(profiler_buffer: torch.Tensor, task_names: List[str
         file_name = file_name + ".perfetto-trace"
     assert profiler_buffer.dtype == torch.uint64
     profiler_buffer_host = profiler_buffer.cpu()
-    num_blocks, num_groups = profiler_buffer_host[:1].view(dtype=torch.int32)
-    num_blocks = int(num_blocks)
-    num_groups = int(num_groups)
+    num_blocks, num_groups = _read_profiler_header(profiler_buffer_host, verbose)
 
     tgen = TraceGenerator(file_name)
 
@@ -544,9 +562,7 @@ def export_to_trace(profiler_buffer: torch.Tensor, task_names: List[str], file_n
         file_name = file_name + ".json"
     assert profiler_buffer.dtype == torch.uint64
     profiler_buffer_host = profiler_buffer.cpu()
-    num_blocks, num_groups = profiler_buffer_host[:1].view(dtype=torch.int32)
-    num_blocks = int(num_blocks)
-    num_groups = int(num_groups)
+    num_blocks, num_groups = _read_profiler_header(profiler_buffer_host, verbose)
 
     pid_names = {}
     pid_map = {}
