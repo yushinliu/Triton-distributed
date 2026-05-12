@@ -38,6 +38,8 @@ from .context import is_empty_slot
 import torch
 from dataclasses import dataclass
 
+MAX_REASONABLE_SM_ID = 4096
+
 
 # adapt from flashinfer/flashinfer/profiler/__init__.py
 def decode_tag(tag, num_groups):
@@ -261,7 +263,7 @@ def _overlaps(lhs_start, lhs_end, rhs_start, rhs_end):
     return max(lhs_start, rhs_start) < min(lhs_end, rhs_end)
 
 
-def _build_dependency_flow_maps(event_map, dependency_metadata):
+def _build_dependency_flow_maps(event_map, dependency_metadata, target_wait_events: bool = True):
     open_flows = defaultdict(list)
     close_flows = defaultdict(list)
     open_terminating_flows = defaultdict(list)
@@ -302,7 +304,7 @@ def _build_dependency_flow_maps(event_map, dependency_metadata):
             continue
 
         wait_key = (consumer_key[0], consumer_key[1], "wait")
-        target_key = wait_key if wait_key in event_map else consumer_key
+        target_key = wait_key if target_wait_events and wait_key in event_map else consumer_key
         target_event = event_map[target_key]
         target_flow_on_close = target_event["event_kind"] == "wait"
 
@@ -338,7 +340,13 @@ def _build_dependency_flow_maps(event_map, dependency_metadata):
 
 
 def _read_profiler_header(profiler_buffer_host: torch.Tensor, verbose: bool = False):
-    num_blocks, num_groups = profiler_buffer_host[:1].view(dtype=torch.int32)
+    header = profiler_buffer_host[:1].view(dtype=torch.int32)
+    if header.numel() < 2:
+        raise ValueError(
+            "Profiler buffer is too short to contain global metadata. "
+            f"Expected one uint64 header slot, got {profiler_buffer_host.numel()} slots."
+        )
+    num_blocks, num_groups = header
     num_blocks = int(num_blocks)
     num_groups = int(num_groups)
     if num_blocks <= 0:
@@ -357,6 +365,51 @@ def _read_profiler_header(profiler_buffer_host: torch.Tensor, verbose: bool = Fa
     return num_blocks, num_groups
 
 
+def _read_block_metadata(profiler_buffer_host: torch.Tensor, num_blocks: int, verbose: bool = False):
+    block_idx_to_smid = {}
+    block_meta_slots = 0
+    metadata = profiler_buffer_host[1:]
+    for i in range(num_blocks):
+        entry = metadata[i:i + 1].view(dtype=torch.uint32)
+        if entry.numel() < 2:
+            if verbose:
+                print(
+                    "Profiler buffer ended before all block metadata was read: "
+                    f"read {block_meta_slots}/{num_blocks} block metadata slots."
+                )
+            break
+
+        block_idx, sm_id = int(entry[0]), int(entry[1])
+        if block_idx != i or sm_id >= MAX_REASONABLE_SM_ID:
+            if verbose:
+                print(
+                    "Profiler block metadata appears truncated or absent at slot "
+                    f"{i}: block_idx={block_idx}, sm_id={sm_id}. "
+                    "Treating the remaining buffer as event records."
+                )
+            break
+
+        block_idx_to_smid[block_idx] = sm_id
+        block_meta_slots += 1
+
+    return block_idx_to_smid, block_meta_slots
+
+
+def _lookup_sm_id(block_idx_to_smid, block_idx, verbose: bool = False):
+    sm_id = block_idx_to_smid.get(block_idx)
+    if sm_id is not None:
+        return sm_id
+    if verbose:
+        print(f"Missing block metadata for block_idx={block_idx}; using block_idx as the trace lane id.")
+    sm_id = block_idx
+    block_idx_to_smid[block_idx] = sm_id
+    return sm_id
+
+
+def _is_scoreboard_wait_event(event):
+    return event is not None and event.get("event_kind") == "wait"
+
+
 # adapt from flashinfer/flashinfer/profiler/__init__.py
 def export_to_perfetto_trace(profiler_buffer: torch.Tensor, task_names: List[str], file_name: str,
                              verbose: bool = False, dependency_metadata: Dict[str, Any] = None) -> None:
@@ -373,16 +426,12 @@ def export_to_perfetto_trace(profiler_buffer: torch.Tensor, task_names: List[str
     pid_map = {}
     track_map: Dict[Tuple[int, int, int], Any] = {}
 
-    block_idx_to_smid = {}
-    profiler_buffer_host = profiler_buffer_host[1:]
+    block_idx_to_smid, block_meta_slots = _read_block_metadata(profiler_buffer_host, num_blocks, verbose)
     # for better view
     if num_groups == 1:
         pid_master = tgen.create_group("tracks of all SMs")
 
-    for i in range(num_blocks):
-        block_idx, sm_id = profiler_buffer_host[i:i + 1].view(dtype=torch.uint32)
-        block_idx, sm_id = int(block_idx), int(sm_id)
-        block_idx_to_smid[block_idx] = sm_id
+    for block_idx, sm_id in block_idx_to_smid.items():
         if num_groups > 1:
             if block_idx not in pid_map:
                 pid_map[block_idx] = tgen.create_group(f"block_{block_idx}_sm_{sm_id}")
@@ -391,22 +440,24 @@ def export_to_perfetto_trace(profiler_buffer: torch.Tensor, task_names: List[str
     if verbose:
         print(f"block_idx_to_smid = {block_idx_to_smid}, {len(block_idx_to_smid)}")
 
-    profiler_buffer_host = profiler_buffer_host[num_blocks:].numpy()
+    profiler_buffer_host = profiler_buffer_host[1 + block_meta_slots:].numpy()
     records = _verify_and_reorg_tracks(profiler_buffer_host, num_blocks, num_groups)
     event_map, event_key_by_record = _build_profile_event_map(records, task_names, dependency_metadata)
     (open_flows, close_flows, open_terminating_flows, close_terminating_flows,
-     flow_count) = _build_dependency_flow_maps(event_map, dependency_metadata)
+     flow_count) = _build_dependency_flow_maps(event_map, dependency_metadata, target_wait_events=True)
     if verbose and dependency_metadata:
         print(f"dependency flow count = {flow_count}")
 
     for block_idx, group_idx, task_type, ts_start, ts_end in records:
-        sm_id = block_idx_to_smid[block_idx]
+        sm_id = _lookup_sm_id(block_idx_to_smid, block_idx, verbose)
         if verbose:
             print(
                 f'block_idx = {block_idx}, group_idx: {group_idx}, task_type = {task_type}, range =[{ts_start}, {ts_end}]'
             )
         # create trackers
-        pid = pid_map[block_idx]
+        if num_groups > 1 and block_idx not in pid_map:
+            pid_map[block_idx] = tgen.create_group(f"block_{block_idx}_sm_{sm_id}")
+        pid = pid_map[block_idx] if num_groups > 1 else pid_master
         cur_task_name = task_names[task_type]
         track_key = (sm_id, )
 
@@ -464,6 +515,14 @@ def _chrome_ts(timestamp_ns):
     return timestamp_ns / 1000.0
 
 
+def _chrome_flow_ts(ts_start, ts_end, prefer_end):
+    if ts_end <= ts_start:
+        return _chrome_ts(ts_start)
+    if prefer_end:
+        return _chrome_ts(ts_end - 1)
+    return _chrome_ts(ts_start + 1)
+
+
 def _add_chrome_metadata_events(trace_events, pid_names, track_allocator):
     for sort_index, pid in enumerate(sorted(pid_names)):
         trace_events.append({
@@ -506,53 +565,79 @@ def _add_chrome_metadata_events(trace_events, pid_names, track_allocator):
         })
 
 
+def _chrome_event_sort_key(event):
+    if event.get("ph") == "M":
+        return (-1, 0, int(event.get("pid", 0)), int(event.get("tid", 0)))
+    phase_order = {
+        "X": 0,
+        "s": 1,
+        "t": 2,
+        "f": 3,
+    }
+    return (event.get("ts", 0), phase_order.get(event.get("ph"), 9), int(event.get("pid", 0)),
+            int(event.get("tid", 0)))
+
+
 def _add_chrome_flow_events(trace_events, event_track_map, event_key, ts_start, ts_end, event_name, open_flows,
                             close_flows, open_terminating_flows, close_terminating_flows):
     if event_key not in event_track_map:
         return
 
     pid, tid = event_track_map[event_key]
+    flow_name = "dependency_flow"
     for flow_id in open_flows.get(event_key, []):
         trace_events.append({
-            "name": event_name,
+            "name": flow_name,
             "cat": "dependency",
             "ph": "s",
-            "ts": _chrome_ts(ts_start),
+            "ts": _chrome_flow_ts(ts_start, ts_end, prefer_end=False),
             "pid": pid,
             "tid": tid,
             "id": int(flow_id),
+            "args": {
+                "slice": event_name,
+            },
         })
     for flow_id in close_flows.get(event_key, []):
         trace_events.append({
-            "name": event_name,
+            "name": flow_name,
             "cat": "dependency",
             "ph": "s",
-            "ts": _chrome_ts(ts_end),
+            "ts": _chrome_flow_ts(ts_start, ts_end, prefer_end=True),
             "pid": pid,
             "tid": tid,
             "id": int(flow_id),
+            "args": {
+                "slice": event_name,
+            },
         })
     for flow_id in open_terminating_flows.get(event_key, []):
         trace_events.append({
-            "name": event_name,
+            "name": flow_name,
             "cat": "dependency",
             "ph": "f",
-            "ts": _chrome_ts(ts_start),
+            "ts": _chrome_flow_ts(ts_start, ts_end, prefer_end=False),
             "pid": pid,
             "tid": tid,
             "id": int(flow_id),
             "bp": "e",
+            "args": {
+                "slice": event_name,
+            },
         })
     for flow_id in close_terminating_flows.get(event_key, []):
         trace_events.append({
-            "name": event_name,
+            "name": flow_name,
             "cat": "dependency",
             "ph": "f",
-            "ts": _chrome_ts(ts_end),
+            "ts": _chrome_flow_ts(ts_start, ts_end, prefer_end=True),
             "pid": pid,
             "tid": tid,
             "id": int(flow_id),
             "bp": "e",
+            "args": {
+                "slice": event_name,
+            },
         })
 
 
@@ -567,17 +652,13 @@ def export_to_trace(profiler_buffer: torch.Tensor, task_names: List[str], file_n
     pid_names = {}
     pid_map = {}
     track_allocator = _ChromeTraceTrackAllocator()
-    block_idx_to_smid = {}
 
-    profiler_buffer_host = profiler_buffer_host[1:]
+    block_idx_to_smid, block_meta_slots = _read_block_metadata(profiler_buffer_host, num_blocks, verbose)
     if num_groups == 1:
         pid_master = 0
         pid_names[pid_master] = "tracks of all SMs"
 
-    for i in range(num_blocks):
-        block_idx, sm_id = profiler_buffer_host[i:i + 1].view(dtype=torch.uint32)
-        block_idx, sm_id = int(block_idx), int(sm_id)
-        block_idx_to_smid[block_idx] = sm_id
+    for block_idx, sm_id in block_idx_to_smid.items():
         if num_groups > 1:
             pid = block_idx
             pid_map[block_idx] = pid
@@ -587,11 +668,11 @@ def export_to_trace(profiler_buffer: torch.Tensor, task_names: List[str], file_n
     if verbose:
         print(f"block_idx_to_smid = {block_idx_to_smid}, {len(block_idx_to_smid)}")
 
-    profiler_buffer_host = profiler_buffer_host[num_blocks:].numpy()
+    profiler_buffer_host = profiler_buffer_host[1 + block_meta_slots:].numpy()
     records = _verify_and_reorg_tracks(profiler_buffer_host, num_blocks, num_groups)
     event_map, event_key_by_record = _build_profile_event_map(records, task_names, dependency_metadata)
     (open_flows, close_flows, open_terminating_flows, close_terminating_flows,
-     flow_count) = _build_dependency_flow_maps(event_map, dependency_metadata)
+     flow_count) = _build_dependency_flow_maps(event_map, dependency_metadata, target_wait_events=False)
     if verbose and dependency_metadata:
         print(f"dependency flow count = {flow_count}")
 
@@ -599,17 +680,23 @@ def export_to_trace(profiler_buffer: torch.Tensor, task_names: List[str], file_n
     event_track_map = {}
     event_time_map = {}
     for block_idx, group_idx, task_type, ts_start, ts_end in records:
-        sm_id = block_idx_to_smid[block_idx]
+        sm_id = _lookup_sm_id(block_idx_to_smid, block_idx, verbose)
         if verbose:
             print(
                 f'block_idx = {block_idx}, group_idx: {group_idx}, task_type = {task_type}, range =[{ts_start}, {ts_end}]'
             )
 
-        pid = pid_map[block_idx]
+        if num_groups > 1 and block_idx not in pid_map:
+            pid = block_idx
+            pid_map[block_idx] = pid
+            pid_names[pid] = f"block_{block_idx}_sm_{sm_id}"
+        pid = pid_map[block_idx] if num_groups > 1 else pid_master
         tid = track_allocator.choose_track(pid, sm_id, ts_start, ts_end)
         cur_task_name = _lookup_task_name(task_names, task_type)
         event_key = event_key_by_record.get((block_idx, group_idx, task_type, ts_start, ts_end))
         event = event_map.get(event_key)
+        if _is_scoreboard_wait_event(event):
+            continue
         args = _event_debug_annotations(event) if event is not None else {}
         if args is None:
             args = {}
@@ -639,6 +726,7 @@ def export_to_trace(profiler_buffer: torch.Tensor, task_names: List[str], file_n
                                 close_flows, open_terminating_flows, close_terminating_flows)
 
     _add_chrome_metadata_events(trace_events, pid_names, track_allocator)
+    trace_events.sort(key=_chrome_event_sort_key)
     trace = {
         "traceEvents": trace_events,
         "displayTimeUnit": "ns",

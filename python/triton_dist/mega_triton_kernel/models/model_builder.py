@@ -796,12 +796,16 @@ class ModelBuilder:
 
     def dump_trace(self, trace_file_prefix="MEGA_KERNEL_TRACE"):
         if self._enable_profiling:
-            from triton_dist.tools.profiler import export_to_perfetto_trace
+            from triton_dist.tools.profiler import export_to_perfetto_trace, export_to_trace
 
             profiler_dir = os.environ.get("MEGA_KERNEL_PRODILER_DIR", "./prof")
             os.makedirs(profiler_dir, exist_ok=True)
             trace_file = os.path.join(profiler_dir, f"{trace_file_prefix}_RANK_{self.rank}")
             self.dump_trace_dependency_map(trace_file)
+            export_to_trace(self.profile_buf,
+                            self.task_types_to_str,
+                            trace_file,
+                            dependency_metadata=self.trace_dependency_metadata)
             export_to_perfetto_trace(self.profile_buf,
                                      self.task_types_to_str,
                                      trace_file,
