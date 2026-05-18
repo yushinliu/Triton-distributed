@@ -34,6 +34,17 @@ class CodeGenOptions:
     enable_profiling: bool = False
     enable_runtime_scheduler: bool = False
     enalbe_task_prefetch: bool = False
+    enable_fake_task_mode: bool = False
+    fake_task_default_nop_iters: int = 1
+    fake_task_nop_iters: Dict[str, int] = None
+
+    def get_fake_task_nop_iters(self, task_name: str) -> int:
+        if self.fake_task_nop_iters is None:
+            return self.fake_task_default_nop_iters
+        return self.fake_task_nop_iters.get(task_name, self.fake_task_default_nop_iters)
+
+
+FAKE_TASK_CODE_TEMPLATE = "fake_task_compute(task_base_info, scoreboard, NOP_ITERS={nop_iters})"
 
 
 def make_mega_kernel_src(tasks_dispatch_code: str, task_types_and_str: Dict[int, str],
@@ -96,6 +107,20 @@ def FETCH_TASK(work_queues, idx, INT_PER_TASK, NUM_SMS, MAX_NUM_TENSOR_DIMS, ENA
     
     task_base_info = TaskBaseInfo(io_tensors_ptr, task_type, layer_id, task_id, tile_id_or_start, depend_entry_start, depend_entry_end, MAX_NUM_TENSOR_DIMS)
     return task_base_info
+
+
+@triton_dist.jit
+def fake_task_compute(task_base_info: TaskBaseInfo, scoreboard: Scoreboard, NOP_ITERS: tl.constexpr):
+    for _ in tl.range(0, NOP_ITERS, 1, loop_unroll_factor=1):
+        tl.inline_asm_elementwise(
+            asm="mov.u32 $0, 0;",
+            constraints="=r",
+            args=[],
+            dtype=tl.int32,
+            is_pure=False,
+            pack=1,
+        )
+    scoreboard.release_tile(task_base_info, task_base_info.tile_id_or_start)
 
 
 @triton_dist.jit
@@ -241,6 +266,10 @@ class CodeGenerator:
 {textwrap.indent(all_codes.strip(), '    ')}
 """
 
+    def generate_fake_task_code(self, task_name: str, codegen_options: CodeGenOptions) -> str:
+        nop_iters = max(0, codegen_options.get_fake_task_nop_iters(task_name))
+        return FAKE_TASK_CODE_TEMPLATE.format(nop_iters=nop_iters)
+
     def generate_code(self, tasks: List['TaskBase'], codegen_options: CodeGenOptions) -> str:
         self._condition_and_codes.clear()
         self._task_types_and_str.clear()
@@ -249,7 +278,10 @@ class CodeGenerator:
             key = task.get_codegen_key(task.layer_id, task.task_id)
             assert isinstance(key, CodeGenKey)
             task_type = type(task)
-            code = registry.get_codegen(task_type)(task)
+            if codegen_options.enable_fake_task_mode:
+                code = self.generate_fake_task_code(task_type.__name__, codegen_options)
+            else:
+                code = registry.get_codegen(task_type)(task)
             if key.task_type not in self._condition_and_codes:
                 self._condition_and_codes[key.task_type] = []
             self._condition_and_codes[key.task_type].append((key, code))

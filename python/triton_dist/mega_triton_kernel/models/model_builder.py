@@ -84,6 +84,41 @@ def check_alignment(tensors):
         assert t.data_ptr() % 16 == 0, f"data_ptr = {t.data_ptr()}"
 
 
+def _read_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _read_nonnegative_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _read_fake_task_nop_iters_env() -> Dict[str, int]:
+    raw = os.getenv("MEGA_KERNEL_FAKE_TASK_NOP_ITERS", "")
+    task_nop_iters = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or ":" not in entry:
+            continue
+        task_name, nop_iters = entry.split(":", 1)
+        task_name = task_name.strip()
+        if not task_name:
+            continue
+        try:
+            task_nop_iters[task_name] = max(0, int(nop_iters.strip()))
+        except ValueError:
+            continue
+    return task_nop_iters
+
+
 class ModelBuilder:
 
     def __init__(self, rank=0, world_size=1, local_world_size=1, num_warps=4, enable_profiling=False,
@@ -125,8 +160,13 @@ class ModelBuilder:
         self._enable_dep_opt = enable_dep_opt
         self._enable_runtime_scheduler = enable_runtime_scheduler
         self._enable_mlp_fc1_silu_fusion = enable_mlp_fc1_silu_fusion
+        enable_fake_task_mode = _read_bool_env("MEGA_KERNEL_FAKE_TASK_MODE",
+                                               _read_bool_env("MEGA_KERNEL_FAKE_TASKS", False))
         self._codegen_options = CodeGenOptions(enable_profiling=enable_profiling,
-                                               enable_runtime_scheduler=enable_runtime_scheduler)
+                                               enable_runtime_scheduler=enable_runtime_scheduler,
+                                               enable_fake_task_mode=enable_fake_task_mode,
+                                               fake_task_default_nop_iters=_read_nonnegative_int_env("MEGA_KERNEL_FAKE_TASK_DEFAULT_NOP_ITERS", 1),
+                                               fake_task_nop_iters=_read_fake_task_nop_iters_env())
         self.task_types_to_str = None
         self.trace_dependency_metadata = None
         self._graph = Graph()
