@@ -48,7 +48,13 @@ from triton_dist.kernels.nvidia.ep_all2all_fused import (
 from triton_dist.kernels.nvidia.group_gemm import GROUP_GEMM_BLOCK_SIZE_M
 from triton_dist.kernels.nvidia.common_ops import NVSHMEM_SIGNAL_DTYPE, nvshmem_barrier_all_on_stream, BarrierAllContext, barrier_all_on_stream
 from triton_dist.tools.profiler import ProfilerBuffer, export_to_perfetto_trace
-from triton_dist.utils import NVSHMEMLazyAllocator, nvshmem_free_lazy_tensor
+from triton_dist.utils import (
+    NCCLGinLazyAllocator,
+    NVSHMEMLazyAllocator,
+    get_triton_dist_comm_backend,
+    nccl_gin_free_lazy_tensor,
+    nvshmem_free_lazy_tensor,
+)
 
 
 @dataclasses.dataclass
@@ -66,6 +72,9 @@ class EPAllToAllLayoutDesc:
     reversed_token_scatter_idx: torch.Tensor
     token_sort_indices: torch.Tensor
     skipped_token_mapping_indices: Optional[torch.Tensor] = None
+    global_topk_indices: Optional[torch.Tensor] = None
+    global_scatter_indices: Optional[torch.Tensor] = None
+    global_token_counts: Optional[torch.Tensor] = None
 
 
 class EpAll2AllFusedOp(torch.nn.Module):
@@ -73,7 +82,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
     def __init__(self, ep_group, max_tokens: int, hidden: int, topk: int, rank: int, num_tot_experts: int,
                  local_world_size: int, world_size: int, dtype=torch.bfloat16, weight_dtype=torch.float32, num_sm=20,
                  sm_margin=0, duplicate_comm_buffer: int = 1, capacity=4.0, FWD_GEMM_BLOCK_SIZE_N=256,
-                 need_reversed_token_scatter_idx=False, lazy: bool = False):
+                 need_reversed_token_scatter_idx=False, lazy: bool = False,
+                 comm_backend: Optional[str] = None):
         super().__init__()
         self.offset_dtype = torch.int32
         self.ep_group = ep_group
@@ -96,8 +106,17 @@ class EpAll2AllFusedOp(torch.nn.Module):
         self.nnodes = self.world_size // self.local_world_size
         self.node_id = self.rank // self.local_world_size
 
-        # Initialize lazy allocator for nvshmem tensors
-        self._nvshmem_allocator = NVSHMEMLazyAllocator(lazy=lazy)
+        self.comm_backend = comm_backend or get_triton_dist_comm_backend() or "nvshmem"
+        if self.comm_backend not in ["nvshmem", "nccl_gin"]:
+            raise ValueError(f"Unsupported EP communication backend: {self.comm_backend}")
+
+        if self.comm_backend == "nvshmem":
+            self._comm_allocator = NVSHMEMLazyAllocator(lazy=lazy)
+            self._free_comm_tensor = nvshmem_free_lazy_tensor
+        else:
+            self._comm_allocator = NCCLGinLazyAllocator(lazy=lazy)
+            self._free_comm_tensor = nccl_gin_free_lazy_tensor
+        self._nvshmem_allocator = self._comm_allocator  # Backward-compatible internal alias.
         self._lazy = lazy
 
         self.is_intra_node = (self.world_size == self.local_world_size)
@@ -229,12 +248,41 @@ class EpAll2AllFusedOp(torch.nn.Module):
         self.barrier_all_workspace = self._nvshmem_allocator.create_tensor("barrier_all_workspace",
                                                                            [self.MAX_SMS, self.world_size], torch.int32,
                                                                            fill_value=0)
-        self.barrier_all_ctx = BarrierAllContext(is_intra_node=(self.nnodes == 1))
+        self.barrier_all_ctx = BarrierAllContext(is_intra_node=(self.nnodes == 1)) if self.comm_backend == "nvshmem" else None
 
         # If not lazy, sync immediately (backward compatible behavior)
         if not lazy:
-            nvshmem_barrier_all_on_stream(torch.cuda.current_stream())
+            if self.comm_backend == "nvshmem":
+                nvshmem_barrier_all_on_stream(torch.cuda.current_stream())
             torch.cuda.synchronize()
+
+    # ==================== Communication Buffer Management APIs ====================
+
+    def _require_nvshmem_kernels(self, op_name: str) -> None:
+        if self.comm_backend != "nvshmem":
+            raise NotImplementedError(
+                f"{op_name} is still implemented with NVSHMEM device kernels. "
+                "NCCL GIN buffer/window registration is wired, but the fused EP MoE "
+                "kernels must be ported from libshmem_device/dl.symm_at to libnccl_device "
+                "window handles before this path can run with comm_backend='nccl_gin'.")
+
+    def get_comm_size(self) -> int:
+        return self._comm_allocator.get_total_size()
+
+    def get_comm_size_gb(self) -> float:
+        return self._comm_allocator.get_total_size_gb()
+
+    def get_comm_size_mb(self) -> float:
+        return self._comm_allocator.get_total_size_mb()
+
+    def get_comm_breakdown(self) -> dict:
+        return self._comm_allocator.get_tensor_breakdown()
+
+    def print_comm_breakdown(self):
+        self._comm_allocator.print_memory_breakdown()
+
+    def is_comm_materialized(self) -> bool:
+        return self._comm_allocator.is_materialized
 
     # ==================== Nvshmem Memory Management APIs ====================
 
@@ -244,15 +292,15 @@ class EpAll2AllFusedOp(torch.nn.Module):
         
         This can be called before sync() to query the total memory needed.
         """
-        return self._nvshmem_allocator.get_total_nvshmem_size()
+        return self.get_comm_size()
 
     def get_nvshmem_size_gb(self) -> float:
         """Get the total nvshmem memory size in GB."""
-        return self._nvshmem_allocator.get_total_nvshmem_size_gb()
+        return self.get_comm_size_gb()
 
     def get_nvshmem_size_mb(self) -> float:
         """Get the total nvshmem memory size in MB."""
-        return self._nvshmem_allocator.get_total_nvshmem_size_mb()
+        return self.get_comm_size_mb()
 
     def get_nvshmem_breakdown(self) -> dict:
         """
@@ -261,15 +309,15 @@ class EpAll2AllFusedOp(torch.nn.Module):
         Returns:
             Dict mapping buffer name to size in bytes
         """
-        return self._nvshmem_allocator.get_tensor_breakdown()
+        return self.get_comm_breakdown()
 
     def print_nvshmem_breakdown(self):
         """Print a human-readable breakdown of nvshmem memory usage."""
-        self._nvshmem_allocator.print_memory_breakdown()
+        self.print_comm_breakdown()
 
     def is_nvshmem_materialized(self) -> bool:
         """Check if nvshmem tensors have been allocated."""
-        return self._nvshmem_allocator.is_materialized
+        return self.is_comm_materialized()
 
     def sync(self):
         """
@@ -278,13 +326,14 @@ class EpAll2AllFusedOp(torch.nn.Module):
         This actually allocates the nvshmem memory for all pending tensors.
         Must be called before using any nvshmem buffers if lazy=True was set.
         """
-        if self._nvshmem_allocator.is_materialized:
+        if self._comm_allocator.is_materialized:
             return
 
-        self._nvshmem_allocator.sync()
+        self._comm_allocator.sync()
 
-        # Run barrier after materialization
-        nvshmem_barrier_all_on_stream(torch.cuda.current_stream())
+        # Run a backend-appropriate barrier after materialization/window registration.
+        if self.comm_backend == "nvshmem":
+            nvshmem_barrier_all_on_stream(torch.cuda.current_stream())
         torch.cuda.synchronize()
 
     def materialize(self):
@@ -292,29 +341,31 @@ class EpAll2AllFusedOp(torch.nn.Module):
         self.sync()
 
     def finalize(self):
-        nvshmem_free_lazy_tensor(self.num_input_tokens_per_rank_comm_buf)
-        nvshmem_free_lazy_tensor(self.expert_indices_signal_buf)
-        nvshmem_free_lazy_tensor(self.weight_send_buf)
-        nvshmem_free_lazy_tensor(self.weight_recv_buf)
-        nvshmem_free_lazy_tensor(self.send_reqs_for_nodes)
-        nvshmem_free_lazy_tensor(self.send_reqs_recv_bufs)
-        nvshmem_free_lazy_tensor(self.send_buf)
-        nvshmem_free_lazy_tensor(self.combine_out_buf)
-        nvshmem_free_lazy_tensor(self.output_buf)
-        nvshmem_free_lazy_tensor(self.combine_in_buf)
-        nvshmem_free_lazy_tensor(self.signal_buf)
-        nvshmem_free_lazy_tensor(self.topk_indices_buf)
-        nvshmem_free_lazy_tensor(self.local_splits_buf)
-        nvshmem_free_lazy_tensor(self.full_splits_buf)
-        nvshmem_free_lazy_tensor(self.splits_signal_buf)
-        nvshmem_free_lazy_tensor(self.intra_node_reduce_buf)
-        nvshmem_free_lazy_tensor(self.mega_dispatch_barrier_buf)
-        nvshmem_free_lazy_tensor(self.mega_combine_barrier_buf)
-        nvshmem_free_lazy_tensor(self.mega_combine_scatter_output_buf)
-        nvshmem_free_lazy_tensor(self.intra_node_dispatch_skipped_token_mapping_indices)
+        self._free_comm_tensor(self.num_input_tokens_per_rank_comm_buf)
+        self._free_comm_tensor(self.expert_indices_signal_buf)
+        self._free_comm_tensor(self.weight_send_buf)
+        self._free_comm_tensor(self.weight_recv_buf)
+        self._free_comm_tensor(self.send_reqs_for_nodes)
+        self._free_comm_tensor(self.send_reqs_recv_bufs)
+        self._free_comm_tensor(self.send_buf)
+        self._free_comm_tensor(self.combine_out_buf)
+        self._free_comm_tensor(self.output_buf)
+        self._free_comm_tensor(self.combine_in_buf)
+        self._free_comm_tensor(self.signal_buf)
+        self._free_comm_tensor(self.topk_indices_buf)
+        self._free_comm_tensor(self.local_splits_buf)
+        self._free_comm_tensor(self.full_splits_buf)
+        self._free_comm_tensor(self.splits_signal_buf)
+        self._free_comm_tensor(self.intra_node_reduce_buf)
+        self._free_comm_tensor(self.mega_dispatch_barrier_buf)
+        self._free_comm_tensor(self.mega_combine_barrier_buf)
+        self._free_comm_tensor(self.mega_combine_scatter_output_buf)
+        self._free_comm_tensor(self.intra_node_dispatch_skipped_token_mapping_indices)
         if self.need_reversed_token_scatter_idx:
-            nvshmem_free_lazy_tensor(self.mega_reversed_token_scatter_idx_buf)
-        nvshmem_free_lazy_tensor(self.barrier_all_workspace)
+            self._free_comm_tensor(self.mega_reversed_token_scatter_idx_buf)
+        self._free_comm_tensor(self.barrier_all_workspace)
+        if hasattr(self._comm_allocator, "finalize"):
+            self._comm_allocator.finalize()
 
     def init_output_buffer(self, num_recv_tokens_per_rank, min_m: Optional[int] = None):
         # `num_recv_tokens_per_rank` is in the pin memory.
@@ -345,9 +396,9 @@ class EpAll2AllFusedOp(torch.nn.Module):
             )
             # delete original buffers
             for i in range(self.duplicate_comm_buffer):
-                nvshmem_free_lazy_tensor(self.output_buffers[i])
+                self._free_comm_tensor(self.output_buffers[i])
                 self.output_buffers[i] = None
-                nvshmem_free_lazy_tensor(self.weight_recv_buffers[i])
+                self._free_comm_tensor(self.weight_recv_buffers[i])
                 self.weight_recv_buffers[i] = None
             del self.output_buffers
             del self.weight_recv_buffers
@@ -356,9 +407,9 @@ class EpAll2AllFusedOp(torch.nn.Module):
             self.weight_recv_buf = None
             del self.weight_recv_buf
 
-            nvshmem_free_lazy_tensor(self.combine_in_buf)
+            self._free_comm_tensor(self.combine_in_buf)
             del self.combine_in_buf
-            nvshmem_free_lazy_tensor(self.combine_gate_in_buf)
+            self._free_comm_tensor(self.combine_gate_in_buf)
             del self.combine_gate_in_buf
 
             torch.distributed.barrier(self.ep_group)
@@ -387,12 +438,128 @@ class EpAll2AllFusedOp(torch.nn.Module):
                                                                                                    cur_output_token_num]
         return output_buf, weight_recv_buf
 
+    def _preprocess_nccl_gin(
+        self,
+        exp_indices: torch.Tensor,
+        full_scatter_indices: Optional[torch.Tensor] = None,
+        local_scatter_indices: Optional[torch.Tensor] = None,
+    ):
+        if self.nnodes != 1:
+            raise NotImplementedError("NCCL GIN EP preprocess currently supports intra-node EP only")
+        if full_scatter_indices is not None or local_scatter_indices is None:
+            raise NotImplementedError("NCCL GIN EP preprocess currently requires local scatter indices")
+
+        assert self.topk_indices_buf.dtype == self.send_reqs_for_nodes.dtype
+        num_dispatch_token_cur_rank = exp_indices.shape[0]
+        num_experts = self.num_tot_experts
+        flat_experts = exp_indices.reshape(-1)
+
+        local_splits = torch.bincount(flat_experts, minlength=num_experts + 1).to(dtype=self.offset_dtype)
+        self.local_splits_buf.copy_(local_splits)
+        self.topk_indices_buf[self.node_id, :num_dispatch_token_cur_rank].copy_(exp_indices)
+        self.full_local_scatter_indices_buf[self.node_id, :num_dispatch_token_cur_rank].copy_(local_scatter_indices)
+
+        gathered_splits = torch.empty((self.world_size, num_experts + 1), dtype=self.offset_dtype, device=exp_indices.device)
+        torch.distributed.all_gather_into_tensor(gathered_splits, local_splits, group=self.ep_group)
+        self.full_splits_buf.copy_(gathered_splits)
+
+        padded_topk = torch.full((self.max_tokens, self.topk), num_experts, dtype=self.offset_dtype, device=exp_indices.device)
+        padded_topk[:num_dispatch_token_cur_rank].copy_(exp_indices)
+        gathered_topk = torch.empty((self.world_size, self.max_tokens, self.topk), dtype=self.offset_dtype,
+                                    device=exp_indices.device)
+        torch.distributed.all_gather_into_tensor(gathered_topk, padded_topk, group=self.ep_group)
+
+        padded_scatter = torch.full((self.max_tokens, self.topk), -1, dtype=self.offset_dtype, device=exp_indices.device)
+        padded_scatter[:num_dispatch_token_cur_rank].copy_(local_scatter_indices)
+        gathered_scatter = torch.empty((self.world_size, self.max_tokens, self.topk), dtype=self.offset_dtype,
+                                       device=exp_indices.device)
+        torch.distributed.all_gather_into_tensor(gathered_scatter, padded_scatter, group=self.ep_group)
+
+        full_splits_cpu = gathered_splits.cpu()
+        gathered_topk_cpu = gathered_topk.cpu()
+        gathered_scatter_cpu = gathered_scatter.cpu()
+        recv_offsets_cpu = torch.zeros((self.world_size, self.experts_per_rank, self.world_size), dtype=self.offset_dtype)
+        recv_tokens_cpu = torch.zeros((self.world_size, self.experts_per_rank), dtype=self.offset_dtype)
+        for dst_rank in range(self.world_size):
+            expert_base = 0
+            for local_expert in range(self.experts_per_rank):
+                expert_idx = dst_rank * self.experts_per_rank + local_expert
+                offset = expert_base
+                for src_rank in range(self.world_size):
+                    recv_offsets_cpu[dst_rank, local_expert, src_rank] = offset
+                    offset += int(full_splits_cpu[src_rank, expert_idx].item())
+                recv_tokens_cpu[dst_rank, local_expert] = offset - expert_base
+                expert_base = offset
+
+        recv_buf_offset_per_expert = recv_offsets_cpu.to(device=exp_indices.device)
+        recv_buf_tokens_per_expert = recv_tokens_cpu.to(device=exp_indices.device)
+        num_recv_tokens_per_rank_cpu = recv_tokens_cpu.sum(dim=1).pin_memory()
+        num_input_tokens_per_rank_cpu = (full_splits_cpu[:, :num_experts].sum(dim=1) // self.topk).to(dtype=self.offset_dtype)
+        num_input_tokens_per_rank = num_input_tokens_per_rank_cpu.to(device=exp_indices.device)
+
+        token_dst_scatter_idx_cpu = torch.full((self.nnodes, self.max_tokens, self.topk), -1, dtype=self.offset_dtype)
+        reversed_token_scatter_idx_cpu = torch.full((self.world_size * self.max_tokens * self.topk, 2), -1,
+                                                    dtype=self.offset_dtype)
+        token_sort_indices_cpu = torch.full((self.nnodes, self.max_tokens * self.topk), -1, dtype=self.offset_dtype)
+
+        cumsum_full = torch.cumsum(full_splits_cpu, dim=1) - full_splits_cpu
+        valid_sort_pos = 0
+        for src_rank in range(self.world_size):
+            ntokens_src = int(num_input_tokens_per_rank_cpu[src_rank].item())
+            for token_id in range(ntokens_src):
+                for topk_id in range(self.topk):
+                    flat_idx = token_id * self.topk + topk_id
+                    expert_idx = int(gathered_topk_cpu[src_rank, token_id, topk_id].item())
+                    if expert_idx >= num_experts:
+                        continue
+                    expert_rank = expert_idx // self.experts_per_rank
+                    expert_idx_intra_rank = expert_idx % self.experts_per_rank
+                    scatter_idx = int(gathered_scatter_cpu[src_rank, token_id, topk_id].item())
+                    scatter_idx_intra_expert = scatter_idx - int(cumsum_full[src_rank, expert_idx].item())
+                    begin_idx_expert_from_recv = int(recv_offsets_cpu[expert_rank, expert_idx_intra_rank, src_rank].item())
+                    to_idx = scatter_idx_intra_expert + begin_idx_expert_from_recv
+                    if src_rank == self.rank:
+                        token_dst_scatter_idx_cpu[self.node_id, token_id, topk_id] = to_idx
+                        token_sort_indices_cpu[self.node_id].view(-1)[valid_sort_pos] = flat_idx
+                        valid_sort_pos += 1
+                    if expert_rank == self.rank:
+                        reversed_token_scatter_idx_cpu[to_idx, 0] = flat_idx
+                        reversed_token_scatter_idx_cpu[to_idx, 1] = src_rank
+
+        token_dst_scatter_idx = token_dst_scatter_idx_cpu.to(device=exp_indices.device)
+        reversed_token_scatter_idx = reversed_token_scatter_idx_cpu.to(device=exp_indices.device)
+        token_sort_indices = token_sort_indices_cpu.to(device=exp_indices.device)
+        send_reqs_for_nodes = torch.zeros_like(self.send_reqs_for_nodes)
+        send_reqs_recv_tensor = torch.zeros_like(self.send_reqs_recv_bufs)
+        topk_indices_tensor = torch.zeros_like(self.topk_indices_buf)
+        topk_indices_tensor[self.node_id, :num_dispatch_token_cur_rank].copy_(exp_indices)
+
+        return EPAllToAllLayoutDesc(
+            num_dispatch_token_cur_rank=num_dispatch_token_cur_rank,
+            recv_buf_offset_per_expert=recv_buf_offset_per_expert,
+            recv_buf_tokens_per_expert=recv_buf_tokens_per_expert,
+            num_recv_tokens_per_rank=num_recv_tokens_per_rank_cpu,
+            num_input_tokens_per_rank=num_input_tokens_per_rank,
+            send_reqs_for_nodes=send_reqs_for_nodes,
+            send_reqs_recv_tensor=send_reqs_recv_tensor,
+            topk_indices_tensor=topk_indices_tensor,
+            non_drop_token_count_tensor=None,
+            token_dst_scatter_idx=token_dst_scatter_idx,
+            reversed_token_scatter_idx=reversed_token_scatter_idx,
+            token_sort_indices=token_sort_indices,
+            global_topk_indices=gathered_topk,
+            global_scatter_indices=gathered_scatter,
+            global_token_counts=num_input_tokens_per_rank,
+        )
+
     def preprocess(
         self,
         exp_indices: torch.Tensor,
         full_scatter_indices: Optional[torch.Tensor] = None,
         local_scatter_indices: Optional[torch.Tensor] = None,
     ):
+        if self.comm_backend == "nccl_gin":
+            return self._preprocess_nccl_gin(exp_indices, full_scatter_indices, local_scatter_indices)
         assert self.topk_indices_buf.dtype == self.send_reqs_for_nodes.dtype
         num_dispatch_token_cur_rank = exp_indices.shape[0]
         self.topk_indices_buf[self.node_id, :num_dispatch_token_cur_rank].copy_(exp_indices)
@@ -489,7 +656,140 @@ class EpAll2AllFusedOp(torch.nn.Module):
         self.intra_node_dispatch_skipped_token_mapping_indices.fill_(-1)
 
     def ep_barrier_all(self):
+        if self.comm_backend == "nccl_gin":
+            torch.cuda.synchronize()
+            torch.distributed.barrier(self.ep_group)
+            return
         barrier_all_on_stream(self.barrier_all_ctx, torch.cuda.current_stream())
+
+    def _pad_first_dim_for_nccl_gin(self, tensor: torch.Tensor, rows: int) -> torch.Tensor:
+        out = tensor.new_zeros((rows, *tensor.shape[1:]))
+        out[:tensor.shape[0]].copy_(tensor)
+        return out
+
+    def _all_gather_padded_for_nccl_gin(self, tensor: torch.Tensor, rows: int) -> torch.Tensor:
+        padded = self._pad_first_dim_for_nccl_gin(tensor, rows).contiguous()
+        gathered = torch.empty((self.world_size, rows, *tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device)
+        torch.distributed.all_gather_into_tensor(gathered, padded, group=self.ep_group)
+        return gathered
+
+    def _expert_group_gemm_for_nccl_gin(
+        self,
+        input_data: torch.Tensor,
+        gemm_weight: torch.Tensor,
+        split_sizes: torch.Tensor,
+        gemm_weight_reduce_last_dim: bool,
+    ) -> torch.Tensor:
+        split_sizes_cpu = split_sizes.detach().cpu().tolist()
+        out_dim = gemm_weight.shape[1] if gemm_weight_reduce_last_dim else gemm_weight.shape[2]
+        if sum(int(v) for v in split_sizes_cpu) == 0:
+            return input_data.new_empty((0, out_dim))
+        outputs = []
+        offset = 0
+        for expert_idx, rows_val in enumerate(split_sizes_cpu):
+            rows = int(rows_val)
+            if rows <= 0:
+                continue
+            x = input_data[offset:offset + rows]
+            w = gemm_weight[expert_idx]
+            outputs.append(x.matmul(w.transpose(0, 1) if gemm_weight_reduce_last_dim else w))
+            offset += rows
+        return torch.cat(outputs, dim=0) if outputs else input_data.new_empty((0, out_dim))
+
+    def _fallback_dispatch_group_gemm_nccl_gin(
+        self,
+        input: torch.Tensor,
+        exp_indices: torch.Tensor,
+        ep_a2a_layout_desc: EPAllToAllLayoutDesc,
+        gemm_weight: torch.Tensor,
+        gemm_weight_reduce_last_dim: bool,
+        weight: Optional[torch.Tensor],
+    ):
+        gathered_input = self._all_gather_padded_for_nccl_gin(input, self.max_tokens)
+        if weight is None:
+            local_weight = torch.ones((input.shape[0], self.topk), dtype=self.weight_dtype, device=input.device)
+        else:
+            local_weight = weight.to(dtype=self.weight_dtype)
+        gathered_weight = self._all_gather_padded_for_nccl_gin(local_weight, self.max_tokens)
+
+        topk_cpu = ep_a2a_layout_desc.global_topk_indices.cpu()
+        token_counts_cpu = ep_a2a_layout_desc.global_token_counts.cpu()
+        input_indices = []
+        weight_indices = []
+        for local_expert in range(self.experts_per_rank):
+            expert_idx = self.rank * self.experts_per_rank + local_expert
+            for src_rank in range(self.world_size):
+                ntokens_src = int(token_counts_cpu[src_rank].item())
+                for token_id in range(ntokens_src):
+                    for topk_id in range(self.topk):
+                        if int(topk_cpu[src_rank, token_id, topk_id].item()) == expert_idx:
+                            input_indices.append(src_rank * self.max_tokens + token_id)
+                            weight_indices.append((src_rank * self.max_tokens + token_id) * self.topk + topk_id)
+
+        if input_indices:
+            input_idx = torch.tensor(input_indices, dtype=torch.long, device=input.device)
+            weight_idx = torch.tensor(weight_indices, dtype=torch.long, device=input.device)
+            dispatch_output_local = gathered_input.reshape(self.world_size * self.max_tokens, self.hidden).index_select(
+                0, input_idx).contiguous()
+            dispatch_weight = gathered_weight.reshape(self.world_size * self.max_tokens * self.topk).index_select(
+                0, weight_idx).contiguous()
+        else:
+            dispatch_output_local = input.new_empty((0, self.hidden))
+            dispatch_weight = local_weight.new_empty((0,))
+
+        token_splits_this_rank = ep_a2a_layout_desc.recv_buf_tokens_per_expert[self.rank]
+        gemm_output = self._expert_group_gemm_for_nccl_gin(
+            dispatch_output_local, gemm_weight, token_splits_this_rank, gemm_weight_reduce_last_dim).contiguous()
+        return dispatch_output_local, dispatch_weight, ep_a2a_layout_desc, gemm_output
+
+    def _fallback_combine_group_gemm_nccl_gin(
+        self,
+        gemm_input_data: torch.Tensor,
+        gemm_weight: torch.Tensor,
+        ep_a2a_layout_desc: EPAllToAllLayoutDesc,
+        gemm_weight_reduce_last_dim: bool,
+        gate_input: Optional[torch.Tensor],
+        combine_output: Optional[torch.Tensor],
+        output_gate: Optional[torch.Tensor],
+        grad_weight: Optional[torch.Tensor],
+    ):
+        token_splits_this_rank = ep_a2a_layout_desc.recv_buf_tokens_per_expert[self.rank]
+        expert_output = self._expert_group_gemm_for_nccl_gin(
+            gemm_input_data, gemm_weight, token_splits_this_rank, gemm_weight_reduce_last_dim).contiguous()
+
+        rows = ep_a2a_layout_desc.num_dispatch_token_cur_rank
+        scatter = expert_output.new_zeros((self.world_size, self.max_tokens * self.topk, expert_output.shape[-1]))
+        rev = ep_a2a_layout_desc.reversed_token_scatter_idx.detach().cpu()
+        for row in range(expert_output.shape[0]):
+            flat_idx = int(rev[row, 0].item())
+            src_rank = int(rev[row, 1].item())
+            if flat_idx >= 0 and src_rank >= 0:
+                scatter[src_rank, flat_idx].copy_(expert_output[row])
+        torch.distributed.all_reduce(scatter, group=self.ep_group)
+        output = scatter[self.rank, :rows * self.topk].view(rows, self.topk, -1).sum(dim=1).contiguous()
+        if combine_output is not None:
+            combine_output.copy_(output)
+            output = combine_output
+
+        if gate_input is not None:
+            gate_scatter = gate_input.new_zeros((self.world_size, self.max_tokens * self.topk))
+            flat_gate = gate_input.reshape(-1)
+            for row in range(min(flat_gate.numel(), rev.shape[0])):
+                flat_idx = int(rev[row, 0].item())
+                src_rank = int(rev[row, 1].item())
+                if flat_idx >= 0 and src_rank >= 0:
+                    gate_scatter[src_rank, flat_idx] = flat_gate[row]
+            torch.distributed.all_reduce(gate_scatter, group=self.ep_group)
+            gate = gate_scatter[self.rank, :rows * self.topk].view(rows, self.topk).contiguous()
+            if output_gate is not None:
+                output_gate.copy_(gate)
+                gate = output_gate
+            if grad_weight is None:
+                return output, gate
+            return output, gate, grad_weight
+        if grad_weight is None:
+            return output
+        return output, grad_weight
 
     def mega_preprocess_group_gemm(
         self,
@@ -587,6 +887,9 @@ class EpAll2AllFusedOp(torch.nn.Module):
         enable_profiler=False,
         profile_file_name: str = "mega_dispatch_group_gemm",
     ):
+        if self.comm_backend == "nccl_gin":
+            return self._fallback_dispatch_group_gemm_nccl_gin(
+                input, exp_indices, ep_a2a_layout_desc, gemm_weight, gemm_weight_reduce_last_dim, weight)
         assert self.nnodes == 1, "Mega dispatch only support single node for now"
         assert input.is_contiguous()
         assert exp_indices.is_contiguous()
@@ -808,6 +1111,10 @@ class EpAll2AllFusedOp(torch.nn.Module):
         enable_profiler: bool = False,
         profile_file_name: str = "mega_group_gemm_combine",
     ):
+        if self.comm_backend == "nccl_gin":
+            return self._fallback_combine_group_gemm_nccl_gin(
+                gemm_input_data, gemm_weight, ep_a2a_layout_desc, gemm_weight_reduce_last_dim, gate_input,
+                combine_output, output_gate, grad_weight)
         assert self.nnodes == 1, "Mega dispatch only support single node for now"
         gemm_problem_shape, gemm_input_strides, gemm_weight_strides, gemm_M_grid = self.mega_preprocess_group_gemm(
             gemm_input_data,

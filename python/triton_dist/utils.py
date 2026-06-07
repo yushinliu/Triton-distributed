@@ -149,6 +149,7 @@ else:
 
 _TRITON_DIST_WORLD: torch.distributed.ProcessGroup = None
 _TRITON_DIST_LOCAL_WORLD_SIZE: int = None
+_TRITON_DIST_COMM_BACKEND: Optional[str] = None
 
 
 def CUDA_CHECK(err):
@@ -185,18 +186,20 @@ def init_seed(seed=0):
 
 
 def init_rocshmem_by_torch_process_group(pg: torch.distributed.ProcessGroup):
-    global _TRITON_DIST_WORLD
+    global _TRITON_DIST_WORLD, _TRITON_DIST_COMM_BACKEND
     assert _TRITON_DIST_WORLD is None, "TRITON_DIST_WORLD has already been initialized"
     _TRITON_DIST_WORLD = pg
+    _TRITON_DIST_COMM_BACKEND = "rocshmem"
 
     pyrocshmem.init_rocshmem_by_uniqueid(pg)
 
 
 def init_mori_by_torch_process_group(pg: torch.distributed.ProcessGroup):
     # TODO:: It will be re-implemented later
-    global _TRITON_DIST_WORLD
+    global _TRITON_DIST_WORLD, _TRITON_DIST_COMM_BACKEND
     assert _TRITON_DIST_WORLD is None, "TRITON_DIST_WORLD has already been initialized"
     _TRITON_DIST_WORLD = pg
+    _TRITON_DIST_COMM_BACKEND = "mori_shmem"
 
     rank, nranks = pg.rank(), pg.size()
     if rank == 0:
@@ -221,10 +224,11 @@ def init_mori_by_torch_process_group(pg: torch.distributed.ProcessGroup):
 
 
 def init_nvshmem_by_torch_process_group(pg: torch.distributed.ProcessGroup):
-    global _TRITON_DIST_WORLD
+    global _TRITON_DIST_WORLD, _TRITON_DIST_COMM_BACKEND
     assert _TRITON_DIST_WORLD is None, "TRITON_DIST_WORLD has already been initialized"
 
     _TRITON_DIST_WORLD = pg
+    _TRITON_DIST_COMM_BACKEND = "nvshmem"
     torch.cuda.synchronize()
     # Extract rank, nranks from process group
     num_ranks = pg.size()
@@ -239,12 +243,45 @@ def init_nvshmem_by_torch_process_group(pg: torch.distributed.ProcessGroup):
     # nvshmem.core.utils._configure_logging("DEBUG")
 
 
+def init_nccl_gin_by_torch_process_group(pg: torch.distributed.ProcessGroup,
+                                         barrier_count: int = 0,
+                                         gin_signal_count: int = 0,
+                                         gin_context_count: int = 4):
+    global _TRITON_DIST_WORLD, _TRITON_DIST_COMM_BACKEND
+    assert _TRITON_DIST_WORLD is None, "TRITON_DIST_WORLD has already been initialized"
+
+    _TRITON_DIST_WORLD = pg
+    _TRITON_DIST_COMM_BACKEND = "nccl_gin"
+    from triton_dist import nccl_gin
+    try:
+        nccl_gin.init_by_torch_process_group(pg, barrier_count, gin_signal_count, gin_context_count)
+    except Exception:
+        _TRITON_DIST_WORLD = None
+        _TRITON_DIST_COMM_BACKEND = None
+        raise
+
+
+def get_triton_dist_comm_backend() -> Optional[str]:
+    return _TRITON_DIST_COMM_BACKEND
+
+
 def is_shmem_initialized() -> bool:
-    return _TRITON_DIST_WORLD is not None
+    return _TRITON_DIST_WORLD is not None and _TRITON_DIST_COMM_BACKEND in ["nvshmem", "rocshmem", "mori_shmem"]
+
+
+def is_nccl_gin_initialized() -> bool:
+    return _TRITON_DIST_WORLD is not None and _TRITON_DIST_COMM_BACKEND == "nccl_gin"
 
 
 def nvshmem_create_tensor(shape, dtype) -> torch.Tensor:
     torch.cuda.synchronize()
+    dims = tuple(shape) if isinstance(shape, (list, tuple, torch.Size)) else (shape,)
+    numel = 1
+    for dim in dims:
+        numel *= int(dim)
+    if numel == 0:
+        # nvshmem4py rejects zero-byte allocations; keep zero-length buffers local.
+        return torch.empty(shape, dtype=dtype, device=torch.device("cuda", torch.cuda.current_device()))
     # NVSHMEM doesn't support fp8 dtypes, use int8 as storage
     if dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
         tensor = nvshmem.core.tensor(shape, dtype=torch.int8)
@@ -271,6 +308,8 @@ def nvshmem_create_tensors(shape, dtype, rank, local_world_size) -> List[torch.T
     torch.cuda.synchronize()
     tensor = nvshmem_create_tensor(shape, dtype=dtype)
     torch.cuda.synchronize()
+    if tensor.numel() == 0:
+        return [tensor for _ in range(rank_on_same_node_start, rank_on_same_node_end)]
     return [_get_peer_tensor(tensor, peer) for peer in range(rank_on_same_node_start, rank_on_same_node_end)]
 
 
@@ -281,15 +320,24 @@ def nvshmem_free_tensor_sync(tensor):
 
 
 def finalize_distributed():
+    global _TRITON_DIST_WORLD, _TRITON_DIST_LOCAL_WORLD_SIZE, _TRITON_DIST_COMM_BACKEND
     if is_cuda():
-        nvshmem.core.finalize()
+        if _TRITON_DIST_COMM_BACKEND == "nccl_gin":
+            from triton_dist import nccl_gin
+            nccl_gin.finalize()
+        elif _TRITON_DIST_COMM_BACKEND == "nvshmem":
+            nvshmem.core.finalize()
     elif is_hip():
-        backend = get_shmem_backend()
+        backend = _TRITON_DIST_COMM_BACKEND or get_shmem_backend()
         if backend == 'rocshmem':
             pyrocshmem.rocshmem_finalize()
         elif backend == 'mori_shmem':
             mori_shmem.shmem_finalize()
-    torch.distributed.destroy_process_group()
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+    _TRITON_DIST_WORLD = None
+    _TRITON_DIST_LOCAL_WORLD_SIZE = None
+    _TRITON_DIST_COMM_BACKEND = None
 
 
 class TorchStreamWrapper:
@@ -313,7 +361,8 @@ def rocshmem_barrier_all_on_stream(stream: Optional[torch.cuda.Stream] = None):
     pyrocshmem.rocshmem_barrier_all_on_stream(stream)
 
 
-def initialize_distributed(seed=None, initialize_shmem: bool = True) -> torch.distributed.ProcessGroup:
+def initialize_distributed(seed=None, initialize_shmem: bool = True,
+                           comm_backend: Optional[str] = None) -> torch.distributed.ProcessGroup:
     RANK = int(os.environ.get("RANK", 0))
     LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
     WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
@@ -336,9 +385,15 @@ def initialize_distributed(seed=None, initialize_shmem: bool = True) -> torch.di
     init_seed(seed=seed if seed is not None else RANK)
     if initialize_shmem:
         if is_cuda():
-            init_nvshmem_by_torch_process_group(pg)
+            comm_backend = comm_backend or "nvshmem"
+            if comm_backend == "nvshmem":
+                init_nvshmem_by_torch_process_group(pg)
+            elif comm_backend == "nccl_gin":
+                init_nccl_gin_by_torch_process_group(pg)
+            else:
+                raise ValueError(f"Invalid CUDA communication backend: '{comm_backend}'")
         elif is_hip():
-            backend = get_shmem_backend()
+            backend = comm_backend or get_shmem_backend()
             if backend == 'rocshmem':
                 init_rocshmem_by_torch_process_group(pg)
             elif backend == 'mori_shmem':
@@ -1502,4 +1557,119 @@ class NVSHMEMLazyAllocator(LazyAllocator):
 
     def get_total_nvshmem_size_mb(self) -> float:
         """Get the total nvshmem size in MB."""
+        return self.get_total_size_mb()
+
+
+
+def nccl_gin_create_tensor(shape, dtype) -> torch.Tensor:
+    """Create an NCCL VMM tensor that can be registered as an NCCL GIN window."""
+    from triton_dist import nccl_gin
+    return nccl_gin.empty(shape, dtype=dtype)
+
+
+def nccl_gin_free_lazy_tensor(tensor_or_lazy):
+    """Drop a GIN tensor reference; window deregistration is owned by NCCLGinLazyAllocator."""
+    return None
+
+
+class NCCLGinLazyAllocator(LazyAllocator):
+    """
+    Lazy allocator for NCCL GIN-backed communication buffers.
+
+    GIN does not allocate symmetric memory like NVSHMEM. It uses ordinary CUDA
+    allocations that are registered with ncclCommWindowRegister after the NCCL
+    GIN communicator is initialized. The allocator keeps those window handles
+    next to the tensors so kernels can receive explicit ncclWindow_t values.
+    """
+
+    def __init__(self, lazy: bool = False, collective_symmetric: bool = True,
+                 strict_ordering_name_markers: Tuple[str, ...] = ("signal", "barrier")):
+        super().__init__(create_tensor_fn=nccl_gin_create_tensor, free_tensor_fn=None, lazy=lazy)
+        self._collective_symmetric = collective_symmetric
+        self._strict_ordering_name_markers = strict_ordering_name_markers
+        self._windows: Dict[int, object] = {}
+        self._strict_ordering_by_key: Dict[int, bool] = {}
+
+    def _tensor_key(self, tensor: torch.Tensor) -> int:
+        return int(tensor.data_ptr())
+
+    def _strict_ordering_for_name(self, name: str) -> bool:
+        lower_name = name.lower()
+        return any(marker in lower_name for marker in self._strict_ordering_name_markers)
+
+    def _register_tensor(self, tensor: torch.Tensor, strict_ordering: bool = False):
+        if tensor.numel() == 0:
+            return None
+        key = self._tensor_key(tensor)
+        strict_ordering = strict_ordering or self._strict_ordering_by_key.get(key, False)
+        if key in self._windows:
+            return self._windows[key]
+        from triton_dist import nccl_gin
+        window = nccl_gin.register_window(
+            tensor,
+            collective_symmetric=self._collective_symmetric,
+            strict_ordering=strict_ordering,
+        )
+        self._windows[key] = window
+        self._strict_ordering_by_key[key] = strict_ordering
+        return window
+
+    def create_tensor(self, name: str, shape: List[int], dtype: torch.dtype,
+                      fill_value: Optional[float] = None) -> LazyTensor:
+        lazy_tensor = super().create_tensor(name, shape, dtype, fill_value)
+        tensor = lazy_tensor.get_underlying_tensor()
+        if tensor is not None:
+            self._strict_ordering_by_key[self._tensor_key(tensor)] = self._strict_ordering_for_name(name)
+            self._register_tensor(tensor)
+        return lazy_tensor
+
+    def sync(self) -> None:
+        if self._materialized and self._windows:
+            return
+        super().sync()
+        for lazy_tensor in self._lazy_tensors:
+            tensor = lazy_tensor.get_underlying_tensor()
+            if tensor is not None:
+                self._strict_ordering_by_key[self._tensor_key(tensor)] = self._strict_ordering_for_name(
+                    lazy_tensor.spec.name)
+                self._register_tensor(tensor)
+
+    def get_window(self, tensor_or_lazy: Union[LazyTensor, torch.Tensor]) -> Optional[int]:
+        tensor = get_underlying_tensor(tensor_or_lazy)
+        if tensor is None:
+            raise RuntimeError("Cannot get an NCCL GIN window for an unmaterialized tensor")
+        window = self._register_tensor(tensor)
+        return None if window is None else int(window)
+
+    def is_strict_ordering_window(self, tensor_or_lazy: Union[LazyTensor, torch.Tensor]) -> bool:
+        tensor = get_underlying_tensor(tensor_or_lazy)
+        if tensor is None:
+            raise RuntimeError("Cannot inspect an NCCL GIN window for an unmaterialized tensor")
+        return self._strict_ordering_by_key.get(self._tensor_key(tensor), False)
+
+    def close(self) -> None:
+        for window in list(self._windows.values()):
+            window.close()
+        self._windows.clear()
+
+    def finalize(self) -> None:
+        self.close()
+
+    def get_total_nccl_gin_size(self) -> int:
+        return self.get_total_size()
+
+    def get_total_nccl_gin_size_gb(self) -> float:
+        return self.get_total_size_gb()
+
+    def get_total_nccl_gin_size_mb(self) -> float:
+        return self.get_total_size_mb()
+
+    # Backward-compatible aliases for EP code that still reports NVSHMEM-sized buffers.
+    def get_total_nvshmem_size(self) -> int:
+        return self.get_total_size()
+
+    def get_total_nvshmem_size_gb(self) -> float:
+        return self.get_total_size_gb()
+
+    def get_total_nvshmem_size_mb(self) -> float:
         return self.get_total_size_mb()

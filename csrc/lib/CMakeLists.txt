@@ -9,14 +9,41 @@ find_program(PYTHON_EXECUTABLE NAMES python3 python)
 find_package(pybind11 REQUIRED HINTS "${Python3_SITELIB}")
 
 file(GLOB LIB_FILES "*.cc")
+list(FILTER LIB_FILES EXCLUDE REGEX ".*/nccl_gin_plugin\\.cc$")
 message(STATUS "lib files: ${LIB_FILES}")
 file(GLOB TRITON_AOT_PYBIND_FILES "../triton_aot_generated/pybind/*.cc")
 message(STATUS "triton AoT pybind files: ${TRITON_AOT_PYBIND_FILES}")
 
 add_library(triton_distributed SHARED ${LIB_FILES} ${TRITON_AOT_PYBIND_FILES})
 target_link_libraries(triton_distributed PUBLIC pybind11::headers Python3::Module)
+target_link_libraries(triton_distributed PUBLIC ${CMAKE_DL_LIBS})
 
-#
+find_path(NCCL_INCLUDE_DIR
+  NAMES nccl.h nccl_device.h
+  HINTS $ENV{NCCL_HOME}
+  PATH_SUFFIXES include
+  PATHS /usr/include)
+
+if(NCCL_INCLUDE_DIR)
+  message(STATUS "Found NCCL include: ${NCCL_INCLUDE_DIR}")
+  target_include_directories(triton_distributed PUBLIC ${NCCL_INCLUDE_DIR})
+else()
+  message(WARNING "NCCL headers were not found; NCCL GIN host bindings may fail to build")
+endif()
+
+add_library(nccl_gin_plugin SHARED nccl_gin.cc)
+set_target_properties(nccl_gin_plugin PROPERTIES
+  OUTPUT_NAME "nccl-gin"
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../../python/triton/_C"
+)
+target_link_libraries(nccl_gin_plugin PUBLIC CUDA::cudart CUDA::cuda_driver)
+target_compile_definitions(nccl_gin_plugin PRIVATE TRITON_DIST_BUILD_NCCL_GIN_PLUGIN)
+target_include_directories(nccl_gin_plugin PUBLIC ".")
+if(NCCL_INCLUDE_DIR)
+  target_include_directories(nccl_gin_plugin PUBLIC ${NCCL_INCLUDE_DIR})
+endif()
+
+
 target_include_directories(triton_distributed PUBLIC ".")
 target_include_directories(triton_distributed PUBLIC "../triton_aot_generated")
 

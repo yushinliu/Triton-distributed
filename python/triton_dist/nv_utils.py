@@ -32,6 +32,7 @@ from pathlib import Path
 import tempfile
 from string import Template
 import sysconfig
+import shutil
 
 from threading import Lock
 from triton_dist.utils import cuda
@@ -409,6 +410,8 @@ def _path_to_binary(binary: str):
     cuda_home = os.getenv("CUDA_HOME", "/usr/local/cuda")
 
     paths += [f"{cuda_home}/bin/{binary}"]
+    if path_from_env := shutil.which(binary):
+        paths.append(path_from_env)
 
     for path in paths:
         if os.path.exists(path) and os.path.isfile(path):
@@ -422,6 +425,13 @@ def _path_to_binary(binary: str):
 
 @functools.lru_cache()
 def get_nvlink():
+    env_nvlink = os.getenv("TRITON_DIST_NVLINK")
+    if env_nvlink:
+        return env_nvlink, os.path.dirname(env_nvlink)
+    cuda_home = os.getenv("CUDA_HOME", "/usr/local/cuda")
+    cuda_nvlink = os.path.join(cuda_home, "bin", "nvlink")
+    if os.path.exists(cuda_nvlink):
+        return cuda_nvlink, os.path.dirname(cuda_nvlink)
     return _path_to_binary("nvlink")
 
 
@@ -568,6 +578,127 @@ class NVSHMEMHelper:
             cubin = NVSHMEMHelper.get_jit_nvshmem_cubin(user_ptx, capability, metadata)
             return cubin
 
+
+class NCCLGinHelper:
+
+    @staticmethod
+    @functools.lru_cache()
+    def get_nccl_include() -> Path:
+        candidates = []
+        if (nccl_home := os.getenv("NCCL_HOME")) is not None:
+            candidates.append(Path(nccl_home) / "include")
+        candidates.extend([
+            Path("/usr/include"),
+            Path("/usr/local/include"),
+            Path(os.getenv("CUDA_HOME", "/usr/local/cuda")) / "include",
+        ])
+
+        try:
+            import nvidia.nccl
+            candidates.append(Path(nvidia.nccl.__path__[0]) / "include")
+        except Exception:
+            pass
+
+        for include in candidates:
+            if (include / "nccl_device.h").exists():
+                return include
+        raise RuntimeError("Unable to find nccl_device.h for NCCL GIN wrapper compilation")
+
+    @staticmethod
+    @functools.lru_cache()
+    def get_nccl_gin_wrapper_src():
+        import triton_dist
+        return Path(triton_dist.__path__[0]) / "tools" / "compile" / "nccl_gin_wrapper.cu"
+
+    @staticmethod
+    @functools.lru_cache()
+    def get_aot_nccl_gin_cubin(capability):
+        return Path(__file__).parent / "lib" / f"nccl_gin_wrapper.sm{capability}.cubin"
+
+    @staticmethod
+    @functools.lru_cache()
+    def extract_nccl_gin_functions() -> dict:
+        file_path = NCCLGinHelper.get_nccl_gin_wrapper_src()
+        functions = {}
+        with open(file_path, "r") as f:
+            content = f.read()
+
+        extern_block_pattern = re.compile(r'extern "C" \{\s*((?:__device__.*?}\s*)+)\s*}', re.DOTALL)
+        device_func_pattern = re.compile(
+            r'__device__\s+'
+            r'([\w\s\*]+?)'
+            r'(triton_dist_nccl_gin[a-zA-Z0-9_]*)\s*\([^\)]*\)\s*'
+            r'\{.*?\}(?=\s*__device__|\s*$)',
+            re.DOTALL,
+        )
+
+        for extern_block in extern_block_pattern.finditer(content):
+            block_content = extern_block.group(1)
+            for match in device_func_pattern.finditer(block_content):
+                functions[match.group(2)] = match.group(0).strip()
+        return functions
+
+    @staticmethod
+    def generate_sub_cu(user_ptx):
+        functions = NCCLGinHelper.extract_nccl_gin_functions()
+        jit_funcs = [code for name, code in functions.items() if name in user_ptx]
+        if not jit_funcs:
+            raise RuntimeError("No NCCL GIN wrapper symbols were referenced by the generated PTX")
+
+        code_template = Template("""
+            #include <nccl_device.h>
+
+            extern "C" {
+            $content
+            }
+        """)
+        return code_template.substitute(content="\n".join(jit_funcs))
+
+    @staticmethod
+    def get_jit_nccl_gin_cubin(user_ptx: str, capability: int, metadata):
+        from triton.backends.nvidia.compiler import sm_arch_from_capability, get_ptxas
+        num_warps = metadata["num_warps"]
+        jit_code = NCCLGinHelper.generate_sub_cu(user_ptx)
+        arch = sm_arch_from_capability(capability)
+        suffix = "a" if capability >= 90 else ""
+        max_reg_per_block = 65536
+        maxnreg = max_reg_per_block // (num_warps * 32)
+        with tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".cu") as fsrc, \
+                tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".ptx") as fptx, \
+                tempfile.NamedTemporaryFile(delete=False, mode="w", suffix=".cubin") as fbin:
+            fsrc.write(jit_code)
+            fsrc.flush()
+            nvcc, _ = get_nvcc()
+            nvcc_cmd = [
+                nvcc, "-rdc=true", "--expt-relaxed-constexpr", "-std=c++17", f"-maxrregcount={maxnreg}",
+                "-ccbin", os.getenv("CXX", "g++"),
+                f"-gencode=arch=compute_{capability}{suffix},code={arch}",
+                "-I", str(NCCLGinHelper.get_nccl_include()),
+                fsrc.name, "-ptx", "-c", "-o", fptx.name,
+            ]
+            try:
+                subprocess.run(nvcc_cmd, check=True, close_fds=False)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"NCCL GIN wrapper PTX generation failed: {e}")
+
+            ptxas = os.getenv("TRITON_DIST_PTXAS")
+            if not ptxas:
+                cuda_home = os.getenv("CUDA_HOME", "/usr/local/cuda")
+                cuda_ptxas = os.path.join(cuda_home, "bin", "ptxas")
+                ptxas = cuda_ptxas if os.path.exists(cuda_ptxas) else get_ptxas().path
+            ptxas_cmd = [ptxas, "-c", fptx.name, f"--gpu-name={arch}", f"-maxrregcount={maxnreg}", "-o", fbin.name]
+            try:
+                subprocess.run(ptxas_cmd, check=True, close_fds=False)
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"NCCL GIN wrapper PTX assembly failed for {arch}: {e}")
+            return fbin.name
+
+    @staticmethod
+    def get_nccl_gin_cubin(user_ptx, capability, metadata):
+        aot_cubin_file = NCCLGinHelper.get_aot_nccl_gin_cubin(capability=capability)
+        if os.path.exists(aot_cubin_file):
+            return aot_cubin_file
+        return NCCLGinHelper.get_jit_nccl_gin_cubin(user_ptx, capability, metadata)
 
 __all__ = [
     "get_numa_node",

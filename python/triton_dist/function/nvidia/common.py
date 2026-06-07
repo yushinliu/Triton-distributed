@@ -173,7 +173,7 @@ def triton_dist_ep_op_initialized(ep_implementation: str = "mega"):
 def init_triton_dist_ep_op(ep_group, max_tokens_per_rank, hidden_size, topk, ep_rank, num_experts, ep_size,
                            dtype=torch.bfloat16, weight_dtype=torch.float32, num_sm=8, sm_margin=0, num_buffers=1,
                            capacity=4.0, ep_implementation: str = "mega",  # ["mega", "mega_recomp", "split_mbs"]
-                           ):
+                           comm_backend: str = "nvshmem"):
     global triton_dist_ep_op
     global triton_dist_ep_op1
     global triton_dist_ep_op2
@@ -186,15 +186,20 @@ def init_triton_dist_ep_op(ep_group, max_tokens_per_rank, hidden_size, topk, ep_
     global bwd_dispatch_event
     global bwd_combine_event
 
-    NVSHMEM_SYMMETRIC_SIZE = os.environ.get("NVSHMEM_SYMMETRIC_SIZE", "-1")
-    if NVSHMEM_SYMMETRIC_SIZE.endswith("g"):
-        NVSHMEM_SYMMETRIC_SIZE = int(NVSHMEM_SYMMETRIC_SIZE[:-1]) * 1e9
-    elif NVSHMEM_SYMMETRIC_SIZE.endswith("m"):
-        NVSHMEM_SYMMETRIC_SIZE = int(NVSHMEM_SYMMETRIC_SIZE[:-1]) * 1e6
-    elif NVSHMEM_SYMMETRIC_SIZE.endswith("k"):
-        NVSHMEM_SYMMETRIC_SIZE = int(NVSHMEM_SYMMETRIC_SIZE[:-1]) * 1e3
-    else:
-        NVSHMEM_SYMMETRIC_SIZE = int(NVSHMEM_SYMMETRIC_SIZE)
+    if comm_backend not in ["nvshmem", "nccl_gin"]:
+        raise ValueError(f"Unsupported EP communication backend: {comm_backend}")
+
+    NVSHMEM_SYMMETRIC_SIZE = None
+    if comm_backend == "nvshmem":
+        NVSHMEM_SYMMETRIC_SIZE = os.environ.get("NVSHMEM_SYMMETRIC_SIZE", "-1")
+        if NVSHMEM_SYMMETRIC_SIZE.endswith("g"):
+            NVSHMEM_SYMMETRIC_SIZE = int(NVSHMEM_SYMMETRIC_SIZE[:-1]) * 1e9
+        elif NVSHMEM_SYMMETRIC_SIZE.endswith("m"):
+            NVSHMEM_SYMMETRIC_SIZE = int(NVSHMEM_SYMMETRIC_SIZE[:-1]) * 1e6
+        elif NVSHMEM_SYMMETRIC_SIZE.endswith("k"):
+            NVSHMEM_SYMMETRIC_SIZE = int(NVSHMEM_SYMMETRIC_SIZE[:-1]) * 1e3
+        else:
+            NVSHMEM_SYMMETRIC_SIZE = int(NVSHMEM_SYMMETRIC_SIZE)
 
     triton_dist_ep_ops = []
 
@@ -208,19 +213,19 @@ def init_triton_dist_ep_op(ep_group, max_tokens_per_rank, hidden_size, topk, ep_
                                              min(8, ep_size), ep_size, dtype=dtype, weight_dtype=weight_dtype,
                                              num_sm=num_sm, sm_margin=sm_margin, duplicate_comm_buffer=num_buffers,
                                              capacity=capacity, FWD_GEMM_BLOCK_SIZE_N=256,
-                                             need_reversed_token_scatter_idx=True, lazy=True)
+                                             need_reversed_token_scatter_idx=True, lazy=True,
+                                             comm_backend=comm_backend)
 
-        # Print nvshmem memory requirement before allocation
+        comm_label = "nvshmem" if comm_backend == "nvshmem" else "nccl_gin"
         if ep_rank == 0:
-            print(f"[EpAll2AllOp] nvshmem memory required: {triton_dist_ep_op.get_nvshmem_size_mb():.2f} MB "
-                  f"({triton_dist_ep_op.get_nvshmem_size_gb():.4f} GB)")
-            triton_dist_ep_op.print_nvshmem_breakdown()
+            print(f"[EpAll2AllOp] {comm_label} buffer memory required: {triton_dist_ep_op.get_comm_size_mb():.2f} MB "
+                  f"({triton_dist_ep_op.get_comm_size_gb():.4f} GB)")
+            triton_dist_ep_op.print_comm_breakdown()
 
-        total_nvshmem = triton_dist_ep_op.get_nvshmem_size()
-        total_nvshmem_mb = triton_dist_ep_op.get_nvshmem_size_mb()
-        total_nvshmem_gb = triton_dist_ep_op.get_nvshmem_size_gb()
+        total_comm = triton_dist_ep_op.get_comm_size()
+        total_comm_mb = triton_dist_ep_op.get_comm_size_mb()
+        total_comm_gb = triton_dist_ep_op.get_comm_size_gb()
 
-        # Actually allocate nvshmem memory
         triton_dist_ep_ops.append(triton_dist_ep_op)
     elif ep_implementation == "split_mbs":
         if triton_dist_ep_op1 is not None:
@@ -238,23 +243,22 @@ def init_triton_dist_ep_op(ep_group, max_tokens_per_rank, hidden_size, topk, ep_
                                               max_tokens_per_rank // 2, hidden_size, topk, ep_rank, num_experts,
                                               min(8, ep_size), ep_size, dtype=dtype, weight_dtype=weight_dtype,
                                               num_sm=num_sm, duplicate_comm_buffer=num_buffers, capacity=capacity,
-                                              lazy=True)
+                                              lazy=True, comm_backend=comm_backend)
         triton_dist_ep_op2 = EpAll2AllFusedOp(ep_group,
                                               max_tokens_per_rank // 2, hidden_size, topk, ep_rank, num_experts,
                                               min(8, ep_size), ep_size, dtype=dtype, weight_dtype=weight_dtype,
                                               num_sm=num_sm, duplicate_comm_buffer=num_buffers, capacity=capacity,
-                                              lazy=True)
+                                              lazy=True, comm_backend=comm_backend)
 
-        # Print nvshmem memory requirement before allocation
-        total_nvshmem = triton_dist_ep_op1.get_nvshmem_size() + triton_dist_ep_op2.get_nvshmem_size()
-        total_nvshmem_mb = triton_dist_ep_op1.get_nvshmem_size_mb() + triton_dist_ep_op2.get_nvshmem_size_mb()
-        total_nvshmem_gb = triton_dist_ep_op1.get_nvshmem_size_gb() + triton_dist_ep_op2.get_nvshmem_size_gb()
+        comm_label = "nvshmem" if comm_backend == "nvshmem" else "nccl_gin"
+        total_comm = triton_dist_ep_op1.get_comm_size() + triton_dist_ep_op2.get_comm_size()
+        total_comm_mb = triton_dist_ep_op1.get_comm_size_mb() + triton_dist_ep_op2.get_comm_size_mb()
+        total_comm_gb = triton_dist_ep_op1.get_comm_size_gb() + triton_dist_ep_op2.get_comm_size_gb()
         if ep_rank == 0:
-            print(f"[EpAll2AllOp] nvshmem memory required (op1): {triton_dist_ep_op1.get_nvshmem_size_mb():.2f} MB")
-            print(f"[EpAll2AllOp] nvshmem memory required (op2): {triton_dist_ep_op2.get_nvshmem_size_mb():.2f} MB")
-            print(f"[EpAll2AllOp] total nvshmem memory required: {total_nvshmem_mb:.2f} MB ({total_nvshmem_gb:.4f} GB)")
+            print(f"[EpAll2AllOp] {comm_label} buffer memory required (op1): {triton_dist_ep_op1.get_comm_size_mb():.2f} MB")
+            print(f"[EpAll2AllOp] {comm_label} buffer memory required (op2): {triton_dist_ep_op2.get_comm_size_mb():.2f} MB")
+            print(f"[EpAll2AllOp] total {comm_label} buffer memory required: {total_comm_mb:.2f} MB ({total_comm_gb:.4f} GB)")
 
-        # Actually allocate nvshmem memory
         triton_dist_ep_ops.append(triton_dist_ep_op1)
         triton_dist_ep_ops.append(triton_dist_ep_op2)
 
@@ -262,12 +266,12 @@ def init_triton_dist_ep_op(ep_group, max_tokens_per_rank, hidden_size, topk, ep_
         raise ValueError(
             f"Invalid ep_implementation: {ep_implementation}, expected: ['triton_dist', 'mega_recomp', 'split_mbs']")
 
-    if NVSHMEM_SYMMETRIC_SIZE == -1 or total_nvshmem > NVSHMEM_SYMMETRIC_SIZE:
-        print(f"[EpAll2AllOp] NVSHMEM_SYMMETRIC_SIZE is too small, required: {total_nvshmem_mb:.2f} MB "
-              f"({total_nvshmem_gb:.4f} GB), but NVSHMEM_SYMMETRIC_SIZE is {NVSHMEM_SYMMETRIC_SIZE} bytes")
+    if comm_backend == "nvshmem" and (NVSHMEM_SYMMETRIC_SIZE == -1 or total_comm > NVSHMEM_SYMMETRIC_SIZE):
+        print(f"[EpAll2AllOp] NVSHMEM_SYMMETRIC_SIZE is too small, required: {total_comm_mb:.2f} MB "
+              f"({total_comm_gb:.4f} GB), but NVSHMEM_SYMMETRIC_SIZE is {NVSHMEM_SYMMETRIC_SIZE} bytes")
         headroom = 500000000  # 500MB
         aligment_size = 100000000  # 100MB
-        total = int((total_nvshmem + headroom) // aligment_size * aligment_size)
+        total = int((total_comm + headroom) // aligment_size * aligment_size)
         os.environ["NVSHMEM_SYMMETRIC_SIZE"] = str(total)
         if ep_rank == 0:
             print(f"[EpAll2AllOp] NVSHMEM_SYMMETRIC_SIZE is updated to {total} bytes")
@@ -279,7 +283,8 @@ def init_triton_dist_ep_op(ep_group, max_tokens_per_rank, hidden_size, topk, ep_
         return torch.empty(size, device="cuda", dtype=torch.int8)
 
     triton.set_allocator(alloc_fn)
-    torch.distributed.barrier(ep_group)
+    if comm_backend == "nvshmem":
+        torch.distributed.barrier(ep_group)
 
 
 def deinit_triton_dist_ep_op(ep_implementation: str = "mega"):

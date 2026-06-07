@@ -22,6 +22,6 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
-from . import language_extra, libnvshmem_device
+from . import language_extra, libnccl_device, libnvshmem_device
 
-__all__ = ["language_extra", "libnvshmem_device"]
+__all__ = ["language_extra", "libnccl_device", "libnvshmem_device"]

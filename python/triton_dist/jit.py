@@ -173,7 +173,7 @@ class TritonDistJITFunction(KernelInterface[T]):
 
 def nvidia_stages_inspection_hook(self, stages, options, language, capability):
     from triton.backends.nvidia.compiler import sm_arch_from_capability, get_ptxas
-    from triton_dist.nv_utils import NVSHMEMHelper, get_nvlink
+    from triton_dist.nv_utils import NCCLGinHelper, NVSHMEMHelper, get_nvlink
 
     def make_cubin(self, src, metadata, opt, capability):
         ptxas = get_ptxas().path
@@ -185,7 +185,9 @@ def nvidia_stages_inspection_hook(self, stages, options, language, capability):
 
             fbin_combined = fbin + ".combined.cubin"
             has_nvshmem_wrapper = bool(re.search(r'nvshmem\w*wrapper\b', src))
-            compile_only_cmds = ["-c"] if has_nvshmem_wrapper else []
+            has_nccl_gin_wrapper = bool(re.search(r'triton_dist_nccl_gin\w*wrapper\b', src))
+            has_device_wrapper = has_nvshmem_wrapper or has_nccl_gin_wrapper
+            compile_only_cmds = ["-c"] if has_device_wrapper else []
             line_info = ["-lineinfo", "-suppress-debug-info"] if knobs.compilation.disable_line_info else ["-lineinfo"]
             fmad = [] if opt.enable_fp_fusion else ['--fmad=false']
             arch = sm_arch_from_capability(capability)
@@ -223,26 +225,27 @@ def nvidia_stages_inspection_hook(self, stages, options, language, capability):
                                  f"`ptxas` stderr:\n{log}\n"
                                  f'Repro command: {" ".join(ptxas_cmd)}\n')
 
-            if has_nvshmem_wrapper:
-                # nvlink
+            if has_device_wrapper:
                 nvlink, _ = get_nvlink()
-                nvlink_cmds = [
-                    nvlink,
-                    f"-arch={arch}",
-                    f"-L{NVSHMEMHelper.get_nvshmem_lib()}",
-                    "-lnvshmem_device",
-                    fbin,
-                    NVSHMEMHelper.get_nvshmem_cubin(src, capability, metadata).__str__(),
-                    "-o",
-                    fbin_combined,
-                ]
+                nvlink_cmds = [nvlink, f"-arch={arch}"]
+                if has_nvshmem_wrapper:
+                    nvlink_cmds.extend([
+                        f"-L{NVSHMEMHelper.get_nvshmem_lib()}",
+                        "-lnvshmem_device",
+                    ])
+                nvlink_cmds.append(fbin)
+                if has_nvshmem_wrapper:
+                    nvlink_cmds.append(NVSHMEMHelper.get_nvshmem_cubin(src, capability, metadata).__str__())
+                if has_nccl_gin_wrapper:
+                    nvlink_cmds.append(NCCLGinHelper.get_nccl_gin_cubin(src, capability, metadata).__str__())
+                nvlink_cmds.extend(["-o", fbin_combined])
                 try:
                     subprocess.run(nvlink_cmds, check=True, close_fds=False, stderr=flog)
                 except Exception as e:
                     import logging
                     logging.error(f"error runing nvlink: {nvlink_cmds}")
                     logging.exception(e)
-            if has_nvshmem_wrapper:
+            if has_device_wrapper:
                 with open(fbin_combined, "rb") as f:
                     cubin = f.read()
             else:

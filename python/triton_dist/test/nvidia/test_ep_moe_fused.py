@@ -32,7 +32,7 @@ from torch.profiler import profile, ProfilerActivity
 
 from triton_dist.function.nvidia.common import init_triton_dist_ep_op, deinit_triton_dist_ep_op
 from triton_dist.function.nvidia.ep_moe_fused import TritonDistFusedEpMoeFunction
-from triton_dist.utils import finalize_distributed, init_nvshmem_by_torch_process_group
+from triton_dist.utils import finalize_distributed, init_nccl_gin_by_torch_process_group, init_nvshmem_by_torch_process_group
 from triton_dist.profiler_utils import benchmark_latency_memory, print_benchmark_comparison
 
 
@@ -51,6 +51,8 @@ def parse_args():
     parser.add_argument("--num_ranks", type=int, default=None, help="Number of EP ranks (default: WORLD_SIZE)")
     parser.add_argument("--sm_margin", type=int, default=0, help="Number of SMs to reserve for other kernels")
     parser.add_argument("--capacity", type=float, default=4.0, help="Capacity of expert group")
+    parser.add_argument("--comm_backend", default="nvshmem", choices=["nvshmem", "nccl_gin"],
+                        help="Communication backend used to initialize Triton-distributed")
     return parser.parse_args()
 
 
@@ -181,7 +183,12 @@ def main():
             print("Skipping MoE tests. Please run with WORLD_SIZE >= NUM_RANKS.")
             return
         EP_GROUP = torch.distributed.new_group(ranks=list(range(NUM_RANKS)), backend="nccl")
-        init_nvshmem_by_torch_process_group(EP_GROUP)
+        if args.comm_backend == "nvshmem":
+            init_nvshmem_by_torch_process_group(EP_GROUP)
+        elif args.comm_backend == "nccl_gin":
+            init_nccl_gin_by_torch_process_group(EP_GROUP)
+        else:
+            raise ValueError(f"Unsupported communication backend: {args.comm_backend}")
     else:
         EP_GROUP = None
         print("Warning: NUM_RANKS=1. MoE requires at least 2 ranks. Skipping tests.")
@@ -194,7 +201,8 @@ def main():
 
     print(f"MoE Test Parameters: ntokens={args.ntokens}, hidden_dim={args.hidden_dim}, "
           f"ffn_dim={args.ffn_dim}, topk={args.topk}, num_experts={args.num_experts}, "
-          f"num_ranks={num_ranks}, DType={DTYPE}, SM Margin={args.sm_margin}\n")
+          f"num_ranks={num_ranks}, DType={DTYPE}, SM Margin={args.sm_margin}, "
+          f"Comm Backend={args.comm_backend}\n")
 
     # Initialize triton_dist EP operation
     max_tokens_per_rank = 8192 * 4
@@ -211,6 +219,7 @@ def main():
         num_sm=64,
         num_buffers=1,
         capacity=args.capacity,
+        comm_backend=args.comm_backend,
     )
 
     # Test configurations
