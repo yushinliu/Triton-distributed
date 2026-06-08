@@ -104,6 +104,58 @@ def gin_put_cta(dev_comm, dst_win, dst_offset, src_win, src_offset, nbytes, peer
 
 
 @core.extern
+def gin_put_warp(dev_comm, dst_win, dst_offset, src_win, src_offset, nbytes, peer, context, _semantic=None):
+    return extern_call(
+        "libnccl_device",
+        "",
+        [
+            tl.cast(dev_comm, void_ptr, _semantic=_semantic),
+            _u64(dst_win, _semantic),
+            _u64(dst_offset, _semantic),
+            _u64(src_win, _semantic),
+            _u64(src_offset, _semantic),
+            _u64(nbytes, _semantic),
+            _i32(peer, _semantic),
+            _i32(context, _semantic),
+        ],
+        {
+            (void_ptr, tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.int32, tl.int32): (
+                "triton_dist_nccl_gin_put_warp_wrapper",
+                (),
+            ),
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
+def gin_put_thread(dev_comm, dst_win, dst_offset, src_win, src_offset, nbytes, peer, context, _semantic=None):
+    return extern_call(
+        "libnccl_device",
+        "",
+        [
+            tl.cast(dev_comm, void_ptr, _semantic=_semantic),
+            _u64(dst_win, _semantic),
+            _u64(dst_offset, _semantic),
+            _u64(src_win, _semantic),
+            _u64(src_offset, _semantic),
+            _u64(nbytes, _semantic),
+            _i32(peer, _semantic),
+            _i32(context, _semantic),
+        ],
+        {
+            (void_ptr, tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.int32, tl.int32): (
+                "triton_dist_nccl_gin_put_thread_wrapper",
+                (),
+            ),
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
 def gin_get_cta(dev_comm, remote_win, remote_offset, local_win, local_offset, nbytes, peer, context, _semantic=None):
     return extern_call(
         "libnccl_device",
@@ -179,6 +231,36 @@ def gin_put_va_signal_inc_cta(dev_comm, dst_win, dst_offset, src_win, src_offset
             (void_ptr, tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.int32,
              tl.int32): (
                  "triton_dist_nccl_gin_put_va_signal_inc_cta_wrapper",
+                 (),
+             ),
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
+def gin_put_va_signal_inc_warp(dev_comm, dst_win, dst_offset, src_win, src_offset, nbytes, signal_win, signal_offset,
+                               peer, context, _semantic=None):
+    return extern_call(
+        "libnccl_device",
+        "",
+        [
+            tl.cast(dev_comm, void_ptr, _semantic=_semantic),
+            _u64(dst_win, _semantic),
+            _u64(dst_offset, _semantic),
+            _u64(src_win, _semantic),
+            _u64(src_offset, _semantic),
+            _u64(nbytes, _semantic),
+            _u64(signal_win, _semantic),
+            _u64(signal_offset, _semantic),
+            _i32(peer, _semantic),
+            _i32(context, _semantic),
+        ],
+        {
+            (void_ptr, tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.uint64, tl.int32,
+             tl.int32): (
+                 "triton_dist_nccl_gin_put_va_signal_inc_warp_wrapper",
                  (),
              ),
         },
@@ -278,6 +360,52 @@ def gin_signal_va_inc_cta(dev_comm, signal_win, signal_offset, peer, context, _s
 
 
 @core.extern
+def gin_signal_va_inc_warp(dev_comm, signal_win, signal_offset, peer, context, _semantic=None):
+    return extern_call(
+        "libnccl_device",
+        "",
+        [
+            tl.cast(dev_comm, void_ptr, _semantic=_semantic),
+            _u64(signal_win, _semantic),
+            _u64(signal_offset, _semantic),
+            _i32(peer, _semantic),
+            _i32(context, _semantic),
+        ],
+        {
+            (void_ptr, tl.uint64, tl.uint64, tl.int32, tl.int32): (
+                "triton_dist_nccl_gin_signal_va_inc_warp_wrapper",
+                (),
+            ),
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
+def gin_signal_va_inc_thread(dev_comm, signal_win, signal_offset, peer, context, _semantic=None):
+    return extern_call(
+        "libnccl_device",
+        "",
+        [
+            tl.cast(dev_comm, void_ptr, _semantic=_semantic),
+            _u64(signal_win, _semantic),
+            _u64(signal_offset, _semantic),
+            _i32(peer, _semantic),
+            _i32(context, _semantic),
+        ],
+        {
+            (void_ptr, tl.uint64, tl.uint64, tl.int32, tl.int32): (
+                "triton_dist_nccl_gin_signal_va_inc_thread_wrapper",
+                (),
+            ),
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
 def gin_reset_signal_cta(dev_comm, context, signal, _semantic=None):
     return extern_call(
         "libnccl_device",
@@ -325,6 +453,40 @@ def gin_flush_cta(dev_comm, context, _semantic=None):
         {
             (void_ptr, tl.int32): (
                 "triton_dist_nccl_gin_flush_cta_wrapper",
+                (),
+            ),
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
+def gin_flush_warp(dev_comm, context, _semantic=None):
+    return extern_call(
+        "libnccl_device",
+        "",
+        [tl.cast(dev_comm, void_ptr, _semantic=_semantic), _i32(context, _semantic)],
+        {
+            (void_ptr, tl.int32): (
+                "triton_dist_nccl_gin_flush_warp_wrapper",
+                (),
+            ),
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
+def gin_flush_thread(dev_comm, context, _semantic=None):
+    return extern_call(
+        "libnccl_device",
+        "",
+        [tl.cast(dev_comm, void_ptr, _semantic=_semantic), _i32(context, _semantic)],
+        {
+            (void_ptr, tl.int32): (
+                "triton_dist_nccl_gin_flush_thread_wrapper",
                 (),
             ),
         },

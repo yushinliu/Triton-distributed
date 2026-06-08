@@ -28,6 +28,7 @@ import triton_dist
 import triton.language as tl
 import triton_dist.language as dl
 from triton_dist.language.extra import libshmem_device
+from triton_dist.language.extra.cuda import libnccl_device
 from triton_dist.language.extra.cuda.language_extra import (tid, atomic_add, ld_acquire, __syncthreads, ld_b32,
                                                             atomic_add_per_warp, st, ld)
 from .common_ops import barrier_on_this_grid, barrier_all_intra_node_atomic_cas_block, NVSHMEM_SIGNAL_DTYPE
@@ -67,6 +68,131 @@ def consume_token(token, ptr, _semantic=None):
         _semantic=_semantic,
     )
     return tl.cast(ret_ptr, dtype=tl.pointer_type(ptr.dtype.element_ty), bitcast=True, _semantic=_semantic)
+
+
+@triton_dist.jit(do_not_specialize=["pid", "num_pid"])
+def tile_kernel_dispatch_token_intra_node_nccl_gin(
+    pid,
+    num_pid,
+    counter_ptr,
+    barriers_ptr,
+    recv_buf_offset_per_expert,
+    local_splits_buf,
+    input_buf,
+    output_buf,
+    weight_send_buf,
+    weight_recv_buf,
+    topk_indices_tensor,
+    token_dst_scatter_idx,
+    num_input_tokens_per_rank,
+    token_sort_indices,
+    nccl_gin_dev_comm,
+    nccl_gin_send_win,
+    nccl_gin_output_win,
+    nccl_gin_weight_send_win,
+    nccl_gin_weight_recv_win,
+    nccl_gin_barrier_win,
+    rank,
+    world_size,
+    SKIP_PUTS: tl.constexpr,
+    SKIP_SIGNALS: tl.constexpr,
+    topk: tl.constexpr,
+    hidden_size: tl.constexpr,
+    experts_per_rank: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    WITH_SCATTER_INDICES: tl.constexpr,
+    num_warps: tl.constexpr,
+    profiler: Profiler,
+    ENABLE_PROFILING: tl.constexpr,
+):
+    weight_elem_size = 4
+    token_elem_size = 2
+    signal_elem_size = 8
+    bytes_per_token = token_elem_size * hidden_size
+
+    WARP_SIZE = 32
+    thread_idx = tid(0)
+    lane_idx = thread_idx % WARP_SIZE
+    warp_id = thread_idx // WARP_SIZE
+    total_warps = num_warps * num_pid
+    global_warp_id = pid * num_warps + warp_id
+
+    if ENABLE_PROFILING:
+        profiler = profiler.record(is_start=True, task_type=0)
+    token_num = tl.load(num_input_tokens_per_rank + rank)
+    for send_token_offset in range(global_warp_id, token_num * topk, total_warps):
+        sort_token_offset = ld(token_sort_indices + send_token_offset)
+        if sort_token_offset >= 0:
+            token_offset = sort_token_offset // topk
+            expert_idx = ld(topk_indices_tensor + sort_token_offset)
+            expert_rank = expert_idx // experts_per_rank
+            expert_idx_intra_rank = expert_idx % experts_per_rank
+            if not WITH_SCATTER_INDICES:
+                store_idx = atomic_add_per_warp(
+                    recv_buf_offset_per_expert + expert_rank * experts_per_rank * world_size +
+                    expert_idx_intra_rank * world_size + rank, 1, scope="gpu", semantic="relaxed")
+            else:
+                store_idx = ld(token_dst_scatter_idx + sort_token_offset)
+
+            src_ptr = input_buf + token_offset * hidden_size
+            dst_ptr = output_buf + store_idx.to(tl.int64) * hidden_size
+            if not SKIP_PUTS:
+                if expert_rank == rank:
+                    copy_warp(dst_ptr, src_ptr, bytes_per_token)
+                else:
+                    src_offset = token_offset.to(tl.uint64) * hidden_size * token_elem_size
+                    dst_offset = store_idx.to(tl.uint64) * hidden_size * token_elem_size
+                    libnccl_device.gin_put_warp(
+                        nccl_gin_dev_comm, nccl_gin_output_win, dst_offset, nccl_gin_send_win, src_offset, bytes_per_token,
+                        expert_rank, 0)
+                    libnccl_device.gin_flush_warp(nccl_gin_dev_comm, 0)
+
+            if not WITH_SCATTER_INDICES:
+                st(token_dst_scatter_idx + sort_token_offset, store_idx)
+
+            if HAS_WEIGHT and not SKIP_PUTS:
+                if expert_rank == rank:
+                    copy_warp(weight_recv_buf + store_idx, weight_send_buf + sort_token_offset, weight_elem_size)
+                else:
+                    weight_src_offset = sort_token_offset.to(tl.uint64) * weight_elem_size
+                    weight_dst_offset = store_idx.to(tl.uint64) * weight_elem_size
+                    libnccl_device.gin_put_warp(
+                        nccl_gin_dev_comm, nccl_gin_weight_recv_win, weight_dst_offset, nccl_gin_weight_send_win,
+                        weight_src_offset, weight_elem_size, expert_rank, 0)
+                    libnccl_device.gin_flush_warp(nccl_gin_dev_comm, 0)
+            sync_warp()
+            if lane_idx == 0:
+                tokens_this_expert = ld(local_splits_buf + expert_idx)
+                sent_tokens = atomic_add(counter_ptr + expert_idx, 1, scope="gpu", semantic="relaxed")
+                if sent_tokens == tokens_this_expert - 1 and not SKIP_SIGNALS:
+                    barrier_idx = expert_idx_intra_rank * world_size + rank
+                    if expert_rank == rank:
+                        st(barriers_ptr + barrier_idx, 1, scope="gpu", semantic="release")
+                    else:
+                        signal_offset = barrier_idx.to(tl.uint64) * signal_elem_size
+                        libnccl_device.gin_signal_va_inc_thread(
+                            nccl_gin_dev_comm, nccl_gin_barrier_win, signal_offset, expert_rank, 0)
+                        libnccl_device.gin_flush_thread(nccl_gin_dev_comm, 0)
+    if ENABLE_PROFILING:
+        profiler = profiler.record(is_start=False, task_type=0)
+        profiler = profiler.record(is_start=True, task_type=1)
+    if pid == 0:
+        for i in range(thread_idx, experts_per_rank * world_size, num_warps * WARP_SIZE):
+            tokens_this_expert = ld(local_splits_buf + i)
+            if tokens_this_expert == 0 and not SKIP_SIGNALS:
+                peer = i // experts_per_rank
+                expert_idx_intra_rank = i % experts_per_rank
+                barrier_idx = expert_idx_intra_rank * world_size + rank
+                if peer == rank:
+                    st(barriers_ptr + barrier_idx, 1, scope="gpu", semantic="release")
+                else:
+                    signal_offset = barrier_idx.to(tl.uint64) * signal_elem_size
+                    libnccl_device.gin_signal_va_inc_thread(
+                        nccl_gin_dev_comm, nccl_gin_barrier_win, signal_offset, peer, 0)
+                    libnccl_device.gin_flush_thread(nccl_gin_dev_comm, 0)
+    if ENABLE_PROFILING:
+        profiler = profiler.record(is_start=False, task_type=1)
+    return profiler
 
 
 @triton_dist.jit(do_not_specialize=["pid", "num_pid"])
@@ -482,6 +608,113 @@ def tile_kernel_scatter_token_intra_node(
 
 
 @triton_dist.jit(do_not_specialize=["pid", "num_pid"])
+def tile_kernel_scatter_token_intra_node_nccl_gin(
+    pid,
+    num_pid,
+    barriers_ptr,
+    num_recv_tokens_per_rank,
+    input_buf,
+    scatter_send_buf,
+    gate_input_buf,
+    gate_output_buf,
+    reversed_token_indices_buf,
+    scatter_output_barrier_buf,
+    nccl_gin_dev_comm,
+    nccl_gin_input_win,
+    nccl_gin_scatter_output_win,
+    nccl_gin_gate_input_win,
+    nccl_gin_gate_output_win,
+    nccl_gin_scatter_barrier_win,
+    rank,
+    SKIP_PUTS: tl.constexpr,
+    SKIP_SIGNALS: tl.constexpr,
+    hidden_size: tl.constexpr,
+    BARRIER_TOKEN_BLOCK_SIZE: tl.constexpr,
+    HAS_GATE: tl.constexpr,
+    num_warps: tl.constexpr,
+    profiler: Profiler,
+    ENABLE_PROFILING: tl.constexpr,
+):
+    tl.static_assert(
+        hidden_size % BARRIER_TOKEN_BLOCK_SIZE == 0,
+        f"hidden_size={hidden_size} must be divisible by BARRIER_TOKEN_BLOCK_SIZE={BARRIER_TOKEN_BLOCK_SIZE}")
+    N_BARRIERS_PER_TOKEN: tl.constexpr = hidden_size // BARRIER_TOKEN_BLOCK_SIZE
+    WARP_SIZE = 32
+    token_elem_size = 2
+    gate_elem_size = 4
+    signal_elem_size = 8
+    bytes_per_token = token_elem_size * hidden_size
+
+    thread_idx = tid(0)
+    lane_idx = thread_idx % WARP_SIZE
+    total_warps = num_warps * num_pid
+    warp_id = thread_idx // WARP_SIZE
+    global_warp_id = pid * num_warps + warp_id
+
+    tl.static_assert(scatter_send_buf.dtype.element_ty == tl.bfloat16, "scatter_send_buf must be bfloat16")
+    tl.static_assert(gate_input_buf.dtype.element_ty == tl.float32, "gate_input_buf must be float32")
+    tl.static_assert(reversed_token_indices_buf is not None)
+    tl.static_assert(scatter_output_barrier_buf is not None)
+
+    num_combine_token_cur_rank = tl.load(num_recv_tokens_per_rank + rank)
+
+    if ENABLE_PROFILING:
+        profiler = profiler.record(is_start=True, task_type=0)
+
+    for token_idx in range(global_warp_id, num_combine_token_cur_rank, total_warps):
+        input_token_idx = ld_b32(reversed_token_indices_buf + token_idx * 2)
+        from_rank = ld_b32(reversed_token_indices_buf + token_idx * 2 + 1)
+
+        for barrier_n_idx in range(lane_idx, N_BARRIERS_PER_TOKEN, WARP_SIZE):
+            barrier_idx = token_idx * N_BARRIERS_PER_TOKEN + barrier_n_idx
+            while ld_acquire(barriers_ptr + barrier_idx, scope="gpu") != 1:
+                pass
+        sync_warp()
+
+        if HAS_GATE and not SKIP_PUTS and lane_idx == 0:
+            gate_val = ld_b32(gate_input_buf + token_idx)
+            if from_rank == rank:
+                st(
+                    gate_output_buf.to(tl.pointer_type(tl.uint32)) + input_token_idx,
+                    tl.cast(gate_val, dtype=tl.uint32, bitcast=True))
+            else:
+                gate_src_offset = token_idx.to(tl.uint64) * gate_elem_size
+                gate_dst_offset = input_token_idx.to(tl.uint64) * gate_elem_size
+                libnccl_device.gin_put_thread(
+                    nccl_gin_dev_comm, nccl_gin_gate_output_win, gate_dst_offset, nccl_gin_gate_input_win,
+                    gate_src_offset, gate_elem_size, from_rank, 0)
+                libnccl_device.gin_flush_thread(nccl_gin_dev_comm, 0)
+        sync_warp()
+
+        if not SKIP_PUTS:
+            src_ptr = input_buf + token_idx * hidden_size
+            dst_ptr = scatter_send_buf + input_token_idx.to(tl.int64) * hidden_size
+            if from_rank == rank:
+                copy_warp(dst_ptr, src_ptr, bytes_per_token)
+            else:
+                src_offset = token_idx.to(tl.uint64) * hidden_size * token_elem_size
+                dst_offset = input_token_idx.to(tl.uint64) * hidden_size * token_elem_size
+                libnccl_device.gin_put_warp(
+                    nccl_gin_dev_comm, nccl_gin_scatter_output_win, dst_offset, nccl_gin_input_win, src_offset,
+                    bytes_per_token, from_rank, 0)
+                libnccl_device.gin_flush_warp(nccl_gin_dev_comm, 0)
+        sync_warp()
+
+        if not SKIP_SIGNALS and lane_idx == 0:
+            if from_rank == rank:
+                st(scatter_output_barrier_buf + input_token_idx, 0, scope="gpu", semantic="release")
+            else:
+                signal_offset = input_token_idx.to(tl.uint64) * signal_elem_size
+                libnccl_device.gin_signal_va_inc_thread(
+                    nccl_gin_dev_comm, nccl_gin_scatter_barrier_win, signal_offset, from_rank, 0)
+                libnccl_device.gin_flush_thread(nccl_gin_dev_comm, 0)
+
+    if ENABLE_PROFILING:
+        profiler = profiler.record(is_start=False, task_type=0)
+    return profiler
+
+
+@triton_dist.jit(do_not_specialize=["pid", "num_pid"])
 def tile_kernel_topk_reduce_token_intra_node(
     pid,
     num_pid,
@@ -491,6 +724,7 @@ def tile_kernel_topk_reduce_token_intra_node(
     output_buf,  #[max_tokens, hidden]
     gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
     topk_indices_buf,  # [max_tokens, topk]
+    rank,
     BLOCK_SIZE: tl.constexpr,
     topk: tl.constexpr,
     num_experts,
@@ -501,7 +735,6 @@ def tile_kernel_topk_reduce_token_intra_node(
 ):
     WARP_SIZE = 32
 
-    rank = dl.rank()
     thread_idx = tid(0)
     lane_idx = thread_idx % WARP_SIZE
     total_warps = num_warps * num_pid
@@ -629,6 +862,7 @@ def tile_kernel_moe_grouped_gemm_nk_const(
     NEED_NOTIFY: tl.constexpr,
     USE_BLOCK_WISE_BARRIER: tl.constexpr,
     IS_DISPATCH_TWO_STAGET: tl.constexpr,
+    USE_SYS_WAIT: tl.constexpr,
     ENABLE_PROFILING: tl.constexpr,
 ):
     num_block_n = tl.cdiv(N, BLOCK_SIZE_N)
@@ -657,13 +891,21 @@ def tile_kernel_moe_grouped_gemm_nk_const(
             if USE_BLOCK_WISE_BARRIER:
                 barrier_idx = local_pid_m + tile_begin
                 if thread_idx == 0:
-                    while ld_acquire(barriers_ptr + barrier_idx, scope="gpu") != 1:
-                        pass
+                    if USE_SYS_WAIT:
+                        while ld_acquire(barriers_ptr + barrier_idx, scope="sys") != 1:
+                            pass
+                    else:
+                        while ld_acquire(barriers_ptr + barrier_idx, scope="gpu") != 1:
+                            pass
                 __syncthreads()
             else:
                 barrier_idx = expert_id
-                while ld_acquire(barriers_ptr + barrier_idx, scope="gpu") != 1:
-                    pass
+                if USE_SYS_WAIT:
+                    while ld_acquire(barriers_ptr + barrier_idx, scope="sys") != 1:
+                        pass
+                else:
+                    while ld_acquire(barriers_ptr + barrier_idx, scope="gpu") != 1:
+                        pass
         else:
             if thread_idx < world_size:
                 barrier_idx = expert_id * world_size + thread_idx
@@ -895,6 +1137,19 @@ def mega_kernel_dispatch_token_moe_grouped_gemm(
     barriers_ptr,  # symm buf [max(num_experts, num_gemm_blocks_m)]
     mega_token_rank_table_ptr,  # local buf [max_tokens, local_world_size]
     mega_token_indirect_pos_ptr,  # symm buf [max_tokens * topk * local_world_size]
+    nccl_gin_dev_comm,
+    nccl_gin_send_win,
+    nccl_gin_output_win,
+    nccl_gin_weight_send_win,
+    nccl_gin_weight_recv_win,
+    nccl_gin_barrier_win,
+    explicit_rank,
+    explicit_world_size,
+    USE_NCCL_GIN: tl.constexpr,
+    NCCL_GIN_SKIP_GEMM_WAIT: tl.constexpr,
+    NCCL_GIN_SKIP_GROUP_GEMM: tl.constexpr,
+    NCCL_GIN_SKIP_PUTS: tl.constexpr,
+    NCCL_GIN_SKIP_SIGNALS: tl.constexpr,
     USE_BLOCK_WISE_BARRIER: tl.constexpr,
     NUM_WARPS: tl.constexpr,
     NUM_TAIL_SMS: tl.constexpr,
@@ -905,7 +1160,7 @@ def mega_kernel_dispatch_token_moe_grouped_gemm(
     group_gemm_total_tiles_m = tl.load(num_total_tiles_ptr)
     group_gemm_total_tiles_n = tl.cdiv(N, BLOCK_SIZE_N)
     group_gemm_tasks = group_gemm_total_tiles_m * group_gemm_total_tiles_n
-    total_tasks = num_dispatch_tasks + group_gemm_tasks
+    total_tasks = num_dispatch_tasks if NCCL_GIN_SKIP_GROUP_GEMM else num_dispatch_tasks + group_gemm_tasks
 
     is_leader = (tid(0) == 0)
     profiler = Profiler.create(profiler_buffer, group_id=0, num_groups=1, is_leader=is_leader,
@@ -914,7 +1169,42 @@ def mega_kernel_dispatch_token_moe_grouped_gemm(
     while task_id < total_tasks:
         if task_id < num_dispatch_tasks:
             # dispatch token
-            if NUM_TAIL_SMS > 0:
+            if USE_NCCL_GIN:
+                profiler = tile_kernel_dispatch_token_intra_node_nccl_gin(
+                    task_id,
+                    num_dispatch_tasks,
+                    counter_ptr,
+                    barriers_ptr,
+                    recv_buf_offset_per_expert,
+                    local_splits_buf,
+                    input_buf,
+                    output_buf,
+                    weight_send_buf,
+                    weight_recv_buf,
+                    topk_indices_tensor,
+                    token_dst_scatter_idx,
+                    num_input_tokens_per_rank,
+                    token_sort_indices,
+                    nccl_gin_dev_comm,
+                    nccl_gin_send_win,
+                    nccl_gin_output_win,
+                    nccl_gin_weight_send_win,
+                    nccl_gin_weight_recv_win,
+                    nccl_gin_barrier_win,
+                    explicit_rank,
+                    explicit_world_size,
+                    NCCL_GIN_SKIP_PUTS,
+                    NCCL_GIN_SKIP_SIGNALS,
+                    topk,
+                    hidden_size,
+                    experts_per_rank,
+                    HAS_WEIGHT,
+                    WITH_SCATTER_INDICES,
+                    NUM_WARPS,
+                    profiler,
+                    ENABLE_PROFILING,
+                )
+            elif NUM_TAIL_SMS > 0:
                 profiler = tile_kernel_dispatch_token_intra_node_two_stage(
                     task_id,
                     num_dispatch_tasks,
@@ -983,7 +1273,7 @@ def mega_kernel_dispatch_token_moe_grouped_gemm(
                 group_gemm_tasks,
                 counter_ptr,
                 barriers_ptr,
-                a_ptr if NUM_TAIL_SMS <= 0 else dispatch_output_local,
+                a_ptr if (NUM_TAIL_SMS <= 0 or USE_NCCL_GIN) else dispatch_output_local,
                 b_ptr,
                 c_ptr,
                 expert_ids_ptr,
@@ -1007,10 +1297,11 @@ def mega_kernel_dispatch_token_moe_grouped_gemm(
                 BLOCK_SIZE_K,
                 GROUP_SIZE_M,
                 profiler,
-                NEED_WAIT=True,
+                NEED_WAIT=not NCCL_GIN_SKIP_GEMM_WAIT,
                 NEED_NOTIFY=False,
                 USE_BLOCK_WISE_BARRIER=USE_BLOCK_WISE_BARRIER,
-                IS_DISPATCH_TWO_STAGET=NUM_TAIL_SMS > 0,
+                IS_DISPATCH_TWO_STAGET=(NUM_TAIL_SMS > 0 and not USE_NCCL_GIN),
+                USE_SYS_WAIT=USE_NCCL_GIN,
                 ENABLE_PROFILING=ENABLE_PROFILING,
             )
         task_id = tl.atomic_add(task_counter_ptr, 1)
@@ -1057,6 +1348,18 @@ def mega_kernel_moe_grouped_gemm_combine_token(
     topk_indices_buf,  # [max_tokens, topk]
     token_dst_scatter_idx,  # [max_tokens, topk]
     reversed_token_scatter_idx,  # [max_tokens, topk, 2]
+    nccl_gin_dev_comm,
+    nccl_gin_combine_in_win,
+    nccl_gin_scatter_output_win,
+    nccl_gin_gate_input_win,
+    nccl_gin_gate_output_win,
+    nccl_gin_scatter_barrier_win,
+    explicit_rank,
+    explicit_world_size,
+    USE_NCCL_GIN: tl.constexpr,
+    NCCL_GIN_SKIP_PUTS: tl.constexpr,
+    NCCL_GIN_SKIP_SIGNALS: tl.constexpr,
+    NCCL_GIN_SKIP_REDUCE: tl.constexpr,
     topk: tl.constexpr,
     hidden_size: tl.constexpr,
     expert_per_rank: tl.constexpr,
@@ -1085,7 +1388,13 @@ def mega_kernel_moe_grouped_gemm_combine_token(
 
     sm_id = tl.program_id(0)
     num_sms = tl.num_programs(0)
-    num_experts = expert_per_rank * dl.num_ranks()
+    if USE_NCCL_GIN:
+        rank = explicit_rank
+        world_size = explicit_world_size
+    else:
+        rank = dl.rank()
+        world_size = dl.num_ranks()
+    num_experts = expert_per_rank * world_size
 
     if not USE_SCATTER_MODE:
         if ENABLE_PROFILING:
@@ -1125,6 +1434,7 @@ def mega_kernel_moe_grouped_gemm_combine_token(
                 NEED_NOTIFY=False,
                 IS_DISPATCH_TWO_STAGET=False,
                 USE_BLOCK_WISE_BARRIER=False,
+                USE_SYS_WAIT=False,
                 ENABLE_PROFILING=False,
             )
 
@@ -1132,8 +1442,6 @@ def mega_kernel_moe_grouped_gemm_combine_token(
             profiler = profiler.record(is_start=False, task_type=0)
             profiler = profiler.record(is_start=True, task_type=1)
 
-        rank = dl.rank()
-        world_size = dl.num_ranks()
         barrier_on_this_grid(grid_barrier_workspace_ptr, False)
         if sm_id == 0:
             barrier_all_intra_node_atomic_cas_block(rank, rank, world_size, barrier_all_workspace_ptr)
@@ -1170,7 +1478,7 @@ def mega_kernel_moe_grouped_gemm_combine_token(
             profiler = profiler.record(is_start=False, task_type=2)
 
     else:
-        if scatter_output_barrier_buf is not None:
+        if scatter_output_barrier_buf is not None and not NCCL_GIN_SKIP_REDUCE:
             num_reduce_tasks = num_reduce_tasks
         else:
             num_reduce_tasks = 0
@@ -1213,30 +1521,60 @@ def mega_kernel_moe_grouped_gemm_combine_token(
                     NEED_NOTIFY=True,
                     IS_DISPATCH_TWO_STAGET=False,
                     USE_BLOCK_WISE_BARRIER=False,
+                    USE_SYS_WAIT=False,
                     ENABLE_PROFILING=ENABLE_PROFILING,
                 )
             elif task_id < num_combine_tasks:
-                profiler = tile_kernel_scatter_token_intra_node(
-                    task_id,
-                    num_combine_tasks,
-                    # counter_ptr, # symm buffer, [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
-                    barriers_ptr,  # symm buffer, per token barrier [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
-                    num_recv_tokens_per_rank,
-                    input_buf,  # symm buffer (recv token in dispatch stage)
-                    scatter_output_buf,  #[max_tokens, topk, hidden]
-                    output_buf,  #[max_tokens, hidden]
-                    gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
-                    gate_output_buf,  # symm buffer [max_tokens, topk]
-                    reversed_token_scatter_idx,  # [max_tokens, topk, 2]
-                    scatter_output_barrier_buf,  # [max_tokens, topk, ]
-                    # non_drop_token_count_buf,  # [max_tokens, ]
-                    hidden_size,
-                    BLOCK_SIZE_N,  # same as group gemm block_size_n
-                    HAS_GATE,
-                    NUM_WARPS,
-                    profiler,
-                    ENABLE_PROFILING=ENABLE_PROFILING,
-                )
+                if USE_NCCL_GIN:
+                    profiler = tile_kernel_scatter_token_intra_node_nccl_gin(
+                        task_id,
+                        num_combine_tasks,
+                        barriers_ptr,
+                        num_recv_tokens_per_rank,
+                        input_buf,
+                        scatter_output_buf,
+                        gate_input_buf,
+                        gate_output_buf,
+                        reversed_token_scatter_idx,
+                        scatter_output_barrier_buf,
+                        nccl_gin_dev_comm,
+                        nccl_gin_combine_in_win,
+                        nccl_gin_scatter_output_win,
+                        nccl_gin_gate_input_win,
+                        nccl_gin_gate_output_win,
+                        nccl_gin_scatter_barrier_win,
+                        rank,
+                        NCCL_GIN_SKIP_PUTS,
+                        NCCL_GIN_SKIP_SIGNALS,
+                        hidden_size,
+                        BLOCK_SIZE_N,
+                        HAS_GATE,
+                        NUM_WARPS,
+                        profiler,
+                        ENABLE_PROFILING=ENABLE_PROFILING,
+                    )
+                else:
+                    profiler = tile_kernel_scatter_token_intra_node(
+                        task_id,
+                        num_combine_tasks,
+                        # counter_ptr, # symm buffer, [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
+                        barriers_ptr,  # symm buffer, per token barrier [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
+                        num_recv_tokens_per_rank,
+                        input_buf,  # symm buffer (recv token in dispatch stage)
+                        scatter_output_buf,  #[max_tokens, topk, hidden]
+                        output_buf,  #[max_tokens, hidden]
+                        gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
+                        gate_output_buf,  # symm buffer [max_tokens, topk]
+                        reversed_token_scatter_idx,  # [max_tokens, topk, 2]
+                        scatter_output_barrier_buf,  # [max_tokens, topk, ]
+                        # non_drop_token_count_buf,  # [max_tokens, ]
+                        hidden_size,
+                        BLOCK_SIZE_N,  # same as group gemm block_size_n
+                        HAS_GATE,
+                        NUM_WARPS,
+                        profiler,
+                        ENABLE_PROFILING=ENABLE_PROFILING,
+                    )
             else:  # task_id >= num_combine_tasks + group_gemm_tasks
                 profiler = tile_kernel_topk_reduce_token_intra_node(
                     task_id - num_combine_tasks - group_gemm_tasks,
@@ -1247,6 +1585,7 @@ def mega_kernel_moe_grouped_gemm_combine_token(
                     output_buf,  #[max_tokens, hidden]
                     gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
                     topk_indices_buf,  # [max_tokens, topk]
+                    rank,
                     BLOCK_SIZE_N,  # same as group gemm block_size_n
                     topk,
                     num_experts,
@@ -1258,8 +1597,6 @@ def mega_kernel_moe_grouped_gemm_combine_token(
             task_id = tl.atomic_add(task_counter_ptr, 1)
 
         if scatter_output_barrier_buf is None:
-            rank = dl.rank()
-            world_size = dl.num_ranks()
             barrier_on_this_grid(grid_barrier_workspace_ptr, False)
             if sm_id == 0:
                 barrier_all_intra_node_atomic_cas_block(rank, rank, world_size, barrier_all_workspace_ptr)
@@ -1274,6 +1611,7 @@ def mega_kernel_moe_grouped_gemm_combine_token(
                 output_buf,  #[max_tokens, hidden]
                 gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
                 topk_indices_buf,  # [max_tokens, topk]
+                rank,
                 BLOCK_SIZE_N,  # same as group gemm block_size_n
                 topk,
                 num_experts,
@@ -1326,6 +1664,18 @@ def mega_kernel_moe_grouped_gemm_combine_token_transposed_grouped_gemm(
     topk_indices_buf,  # [max_tokens, topk]
     token_dst_scatter_idx,  # [max_tokens, topk]
     reversed_token_scatter_idx,  # [max_tokens, topk, 2]
+    nccl_gin_dev_comm,
+    nccl_gin_combine_in_win,
+    nccl_gin_scatter_output_win,
+    nccl_gin_gate_input_win,
+    nccl_gin_gate_output_win,
+    nccl_gin_scatter_barrier_win,
+    explicit_rank,
+    explicit_world_size,
+    USE_NCCL_GIN: tl.constexpr,
+    NCCL_GIN_SKIP_PUTS: tl.constexpr,
+    NCCL_GIN_SKIP_SIGNALS: tl.constexpr,
+    NCCL_GIN_SKIP_REDUCE: tl.constexpr,
     topk: tl.constexpr,
     hidden_size: tl.constexpr,
     expert_per_rank: tl.constexpr,
@@ -1376,7 +1726,13 @@ def mega_kernel_moe_grouped_gemm_combine_token_transposed_grouped_gemm(
 
     sm_id = tl.program_id(0)
     num_sms = tl.num_programs(0)
-    num_experts = expert_per_rank * dl.num_ranks()
+    if USE_NCCL_GIN:
+        rank = explicit_rank
+        world_size = explicit_world_size
+    else:
+        rank = dl.rank()
+        world_size = dl.num_ranks()
+    num_experts = expert_per_rank * world_size
 
     if not USE_SCATTER_MODE:
         if ENABLE_PROFILING:
@@ -1416,6 +1772,7 @@ def mega_kernel_moe_grouped_gemm_combine_token_transposed_grouped_gemm(
                 NEED_NOTIFY=False,
                 IS_DISPATCH_TWO_STAGET=False,
                 USE_BLOCK_WISE_BARRIER=False,
+                USE_SYS_WAIT=False,
                 ENABLE_PROFILING=False,
             )
 
@@ -1423,8 +1780,6 @@ def mega_kernel_moe_grouped_gemm_combine_token_transposed_grouped_gemm(
             profiler = profiler.record(is_start=False, task_type=0)
             profiler = profiler.record(is_start=True, task_type=1)
 
-        rank = dl.rank()
-        world_size = dl.num_ranks()
         barrier_on_this_grid(grid_barrier_workspace_ptr, False)
         if sm_id == 0:
             barrier_all_intra_node_atomic_cas_block(rank, rank, world_size, barrier_all_workspace_ptr)
@@ -1496,7 +1851,7 @@ def mega_kernel_moe_grouped_gemm_combine_token_transposed_grouped_gemm(
             task_id = tl.atomic_add(task_counter_ptr, 1)
 
     else:
-        if scatter_output_barrier_buf is not None:
+        if scatter_output_barrier_buf is not None and not NCCL_GIN_SKIP_REDUCE:
             num_reduce_tasks = num_reduce_tasks
         else:
             num_reduce_tasks = 0
@@ -1539,30 +1894,60 @@ def mega_kernel_moe_grouped_gemm_combine_token_transposed_grouped_gemm(
                     NEED_NOTIFY=True,
                     IS_DISPATCH_TWO_STAGET=False,
                     USE_BLOCK_WISE_BARRIER=False,
+                    USE_SYS_WAIT=False,
                     ENABLE_PROFILING=ENABLE_PROFILING,
                 )
             elif task_id < num_combine_tasks:
-                profiler = tile_kernel_scatter_token_intra_node(
-                    task_id,
-                    num_combine_tasks,
-                    # counter_ptr, # symm buffer, [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
-                    barriers_ptr,  # symm buffer, per token barrier [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
-                    num_recv_tokens_per_rank,
-                    input_buf,  # symm buffer (recv token in dispatch stage)
-                    scatter_output_buf,  #[max_tokens, topk, hidden]
-                    output_buf,  #[max_tokens, hidden]
-                    gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
-                    gate_output_buf,  # symm buffer [max_tokens, topk]
-                    reversed_token_scatter_idx,  # [max_tokens, topk, 2]
-                    scatter_output_barrier_buf,  # [max_tokens, topk, ]
-                    # non_drop_token_count_buf,  # [max_tokens, ]
-                    hidden_size,
-                    BLOCK_SIZE_N,  # same as group gemm block_size_n
-                    HAS_GATE,
-                    NUM_WARPS,
-                    profiler,
-                    ENABLE_PROFILING=ENABLE_PROFILING,
-                )
+                if USE_NCCL_GIN:
+                    profiler = tile_kernel_scatter_token_intra_node_nccl_gin(
+                        task_id,
+                        num_combine_tasks,
+                        barriers_ptr,
+                        num_recv_tokens_per_rank,
+                        input_buf,
+                        scatter_output_buf,
+                        gate_input_buf,
+                        gate_output_buf,
+                        reversed_token_scatter_idx,
+                        scatter_output_barrier_buf,
+                        nccl_gin_dev_comm,
+                        nccl_gin_combine_in_win,
+                        nccl_gin_scatter_output_win,
+                        nccl_gin_gate_input_win,
+                        nccl_gin_gate_output_win,
+                        nccl_gin_scatter_barrier_win,
+                        rank,
+                        NCCL_GIN_SKIP_PUTS,
+                        NCCL_GIN_SKIP_SIGNALS,
+                        hidden_size,
+                        BLOCK_SIZE_N,
+                        HAS_GATE,
+                        NUM_WARPS,
+                        profiler,
+                        ENABLE_PROFILING=ENABLE_PROFILING,
+                    )
+                else:
+                    profiler = tile_kernel_scatter_token_intra_node(
+                        task_id,
+                        num_combine_tasks,
+                        # counter_ptr, # symm buffer, [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
+                        barriers_ptr,  # symm buffer, per token barrier [max_tokens * topk * local_world_size, hidden_size // gemm_block_size_n]
+                        num_recv_tokens_per_rank,
+                        input_buf,  # symm buffer (recv token in dispatch stage)
+                        scatter_output_buf,  #[max_tokens, topk, hidden]
+                        output_buf,  #[max_tokens, hidden]
+                        gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
+                        gate_output_buf,  # symm buffer [max_tokens, topk]
+                        reversed_token_scatter_idx,  # [max_tokens, topk, 2]
+                        scatter_output_barrier_buf,  # [max_tokens, topk, ]
+                        # non_drop_token_count_buf,  # [max_tokens, ]
+                        hidden_size,
+                        BLOCK_SIZE_N,  # same as group gemm block_size_n
+                        HAS_GATE,
+                        NUM_WARPS,
+                        profiler,
+                        ENABLE_PROFILING=ENABLE_PROFILING,
+                    )
             elif task_id >= num_combine_tasks + group_gemm_tasks and task_id < num_combine_tasks + group_gemm_tasks + num_reduce_tasks:
                 profiler = tile_kernel_topk_reduce_token_intra_node(
                     task_id - num_combine_tasks - group_gemm_tasks,
@@ -1573,6 +1958,7 @@ def mega_kernel_moe_grouped_gemm_combine_token_transposed_grouped_gemm(
                     output_buf,  #[max_tokens, hidden]
                     gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
                     topk_indices_buf,  # [max_tokens, topk]
+                    rank,
                     BLOCK_SIZE_N,  # same as group gemm block_size_n
                     topk,
                     num_experts,
@@ -1611,8 +1997,6 @@ def mega_kernel_moe_grouped_gemm_combine_token_transposed_grouped_gemm(
             task_id = tl.atomic_add(task_counter_ptr, 1)
 
         if scatter_output_barrier_buf is None:
-            rank = dl.rank()
-            world_size = dl.num_ranks()
             barrier_on_this_grid(grid_barrier_workspace_ptr, False)
             if sm_id == 0:
                 barrier_all_intra_node_atomic_cas_block(rank, rank, world_size, barrier_all_workspace_ptr)
@@ -1627,6 +2011,7 @@ def mega_kernel_moe_grouped_gemm_combine_token_transposed_grouped_gemm(
                 output_buf,  #[max_tokens, hidden]
                 gate_input_buf,  # symm buffer [dynamic_num_of_tokens]
                 topk_indices_buf,  # [max_tokens, topk]
+                rank,
                 BLOCK_SIZE_N,  # same as group gemm block_size_n
                 topk,
                 num_experts,

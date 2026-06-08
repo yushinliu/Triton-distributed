@@ -236,7 +236,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
             "mega_combine_scatter_output_buf", [self.max_tokens * self.topk, self.hidden], dtype)
         self.mega_combine_scatter_output_barrier_buf = self._nvshmem_allocator.create_tensor(
             "mega_combine_scatter_output_barrier_buf", [self.max_tokens * self.topk * self.local_world_size],
-            torch.int32)
+            NVSHMEM_SIGNAL_DTYPE)
         if self.need_reversed_token_scatter_idx:
             self.mega_reversed_token_scatter_idx_buf = self._nvshmem_allocator.create_tensor(
                 "mega_reversed_token_scatter_idx_buf", [self.world_size * self.max_tokens * self.topk, 2],
@@ -493,7 +493,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
 
         recv_buf_offset_per_expert = recv_offsets_cpu.to(device=exp_indices.device)
         recv_buf_tokens_per_expert = recv_tokens_cpu.to(device=exp_indices.device)
-        num_recv_tokens_per_rank_cpu = recv_tokens_cpu.sum(dim=1).pin_memory()
+        num_recv_tokens_per_rank_cpu = recv_tokens_cpu.sum(dim=1).to(dtype=self.offset_dtype).pin_memory()
         num_input_tokens_per_rank_cpu = (full_splits_cpu[:, :num_experts].sum(dim=1) // self.topk).to(dtype=self.offset_dtype)
         num_input_tokens_per_rank = num_input_tokens_per_rank_cpu.to(device=exp_indices.device)
 
@@ -887,7 +887,9 @@ class EpAll2AllFusedOp(torch.nn.Module):
         enable_profiler=False,
         profile_file_name: str = "mega_dispatch_group_gemm",
     ):
-        if self.comm_backend == "nccl_gin":
+        use_nccl_gin_fused_dispatch = self.comm_backend == "nccl_gin" and os.environ.get(
+            "TRITON_DIST_NCCL_GIN_FUSED_DISPATCH", "1") != "0"
+        if self.comm_backend == "nccl_gin" and not use_nccl_gin_fused_dispatch:
             return self._fallback_dispatch_group_gemm_nccl_gin(
                 input, exp_indices, ep_a2a_layout_desc, gemm_weight, gemm_weight_reduce_last_dim, weight)
         assert self.nnodes == 1, "Mega dispatch only support single node for now"
@@ -912,6 +914,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
             self.send_buf[self.node_id, :token_num].copy_(input)
 
         has_weight = (weight is not None)
+        kernel_has_weight = has_weight and not (
+            self.comm_backend == "nccl_gin" and os.environ.get("TRITON_DIST_NCCL_GIN_SKIP_WEIGHT", "0") != "0")
         if has_weight:
             assert weight.shape[0] == token_num
             assert weight.shape[1] == self.topk
@@ -965,6 +969,29 @@ class EpAll2AllFusedOp(torch.nn.Module):
         # fill_tensor(self._task_counter_buf, 0, 1)
         self._task_counter_buf.zero_()
 
+        nccl_gin_debug = use_nccl_gin_fused_dispatch and os.environ.get("TRITON_DIST_NCCL_GIN_DEBUG", "0") != "0"
+        if use_nccl_gin_fused_dispatch:
+            from triton_dist import nccl_gin
+            nccl_gin_dev_comm = nccl_gin.get_dev_comm_tensor(input.device)
+            nccl_gin_send_win = self._comm_allocator.get_window(self.send_buf)
+            nccl_gin_output_win = self._comm_allocator.get_window(self.output_buf)
+            nccl_gin_weight_send_win = self._comm_allocator.get_window(self.weight_send_buf)
+            nccl_gin_weight_recv_win = self._comm_allocator.get_window(self.weight_recv_buf)
+            nccl_gin_barrier_win = self._comm_allocator.get_window(self.mega_dispatch_barrier_buf)
+            kernel_num_tail_sms = 0
+            kernel_use_block_wise_barrier = False
+            NUM_DISPATCH_SM = int(os.environ.get("TRITON_DIST_NCCL_GIN_DISPATCH_SMS", "1"))
+            num_warps = int(os.environ.get("TRITON_DIST_NCCL_GIN_DISPATCH_WARPS", "1"))
+        else:
+            nccl_gin_dev_comm = self._task_counter_buf
+            nccl_gin_send_win = 0
+            nccl_gin_output_win = 0
+            nccl_gin_weight_send_win = 0
+            nccl_gin_weight_recv_win = 0
+            nccl_gin_barrier_win = 0
+            kernel_num_tail_sms = num_tail_sms
+            kernel_use_block_wise_barrier = use_block_wise_barrier
+
         if enable_profiler:
             tasks_names = [
                 "dispatch_token_main", "dispatch_token_tail_notify", "group_gemm_wait", "group_gemm_preprocess",
@@ -982,6 +1009,8 @@ class EpAll2AllFusedOp(torch.nn.Module):
         assert self.mega_dispatch_barrier_buf.shape[
             0] >= gemm_M_grid, f"mega_dispatch_barrier_buf.shape[0] ({self.mega_dispatch_barrier_buf.shape[0]}) must be >= gemm_M_grid ({gemm_M_grid})"
 
+        if nccl_gin_debug:
+            print(f"[rank {self.rank}] nccl_gin dispatch launch tokens={token_num} dispatch_sms={NUM_DISPATCH_SM}", flush=True)
         mega_kernel_dispatch_token_moe_grouped_gemm[grid](
             self._task_counter_buf,
 
@@ -1000,7 +1029,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
             self.topk,
             self.hidden,
             self.experts_per_rank,
-            has_weight,  # HAS_WEIGHT
+            kernel_has_weight,  # HAS_WEIGHT
             with_scatter_indices,  # WITH_SCATTER_INDICES
 
             #
@@ -1035,14 +1064,36 @@ class EpAll2AllFusedOp(torch.nn.Module):
             self.mega_dispatch_barrier_buf,  # symm buf [num_experts_per_rank, num_ranks] = [num_experts]
             self.mega_token_rank_table_buf,  # local buf [max_tokens, local_world_size]
             self.mega_token_indirect_pos_buf,  # symm buf [max_tokens * topk * local_world_size]
-            USE_BLOCK_WISE_BARRIER=use_block_wise_barrier,
+            nccl_gin_dev_comm,
+            nccl_gin_send_win,
+            nccl_gin_output_win,
+            nccl_gin_weight_send_win,
+            nccl_gin_weight_recv_win,
+            nccl_gin_barrier_win,
+            self.rank,
+            self.world_size,
+            USE_NCCL_GIN=use_nccl_gin_fused_dispatch,
+            NCCL_GIN_SKIP_GEMM_WAIT=(use_nccl_gin_fused_dispatch and os.environ.get(
+                "TRITON_DIST_NCCL_GIN_SKIP_GEMM_WAIT", "0") != "0"),
+            NCCL_GIN_SKIP_GROUP_GEMM=(use_nccl_gin_fused_dispatch and os.environ.get(
+                "TRITON_DIST_NCCL_GIN_SKIP_GROUP_GEMM", "0") != "0"),
+            NCCL_GIN_SKIP_PUTS=(use_nccl_gin_fused_dispatch and os.environ.get(
+                "TRITON_DIST_NCCL_GIN_SKIP_PUTS", "0") != "0"),
+            NCCL_GIN_SKIP_SIGNALS=(use_nccl_gin_fused_dispatch and os.environ.get(
+                "TRITON_DIST_NCCL_GIN_SKIP_SIGNALS", "0") != "0"),
+            USE_BLOCK_WISE_BARRIER=kernel_use_block_wise_barrier,
             NUM_WARPS=num_warps,
-            NUM_TAIL_SMS=num_tail_sms,
+            NUM_TAIL_SMS=kernel_num_tail_sms,
             num_warps=num_warps,
             num_stages=gemm_num_stages,
             profiler_buffer=profiler_buffer,
             ENABLE_PROFILING=enable_profiler,
         )
+
+        if nccl_gin_debug:
+            print(f"[rank {self.rank}] nccl_gin dispatch kernel launched", flush=True)
+            torch.cuda.current_stream().synchronize()
+            print(f"[rank {self.rank}] nccl_gin dispatch stream synchronized", flush=True)
 
         if enable_profiler:
             os.makedirs("prof/mega", exist_ok=True)
@@ -1050,14 +1101,22 @@ class EpAll2AllFusedOp(torch.nn.Module):
 
         if not with_scatter_indices:
             ep_a2a_layout_desc.token_dst_scatter_idx = token_dst_scatter_idx
+        if nccl_gin_debug:
+            print(f"[rank {self.rank}] nccl_gin dispatch before ep barrier", flush=True)
         self.ep_barrier_all()
+        if nccl_gin_debug:
+            print(f"[rank {self.rank}] nccl_gin dispatch after ep barrier", flush=True)
         self.dispatch_postprocess()
+        if nccl_gin_debug:
+            print(f"[rank {self.rank}] nccl_gin dispatch before cleanup ep barrier", flush=True)
         self.ep_barrier_all()
+        if nccl_gin_debug:
+            print(f"[rank {self.rank}] nccl_gin dispatch after cleanup ep barrier", flush=True)
 
         dispatch_res = dispatch_output_buf
         weight_res = weight_recv_buf
 
-        if num_tail_sms <= 0:
+        if kernel_num_tail_sms <= 0:
             # one-stage dispatch does not do checkpoint, do it additionally
             copy_tensor(dispatch_output_local, dispatch_res, persistent=False)
 
@@ -1111,7 +1170,9 @@ class EpAll2AllFusedOp(torch.nn.Module):
         enable_profiler: bool = False,
         profile_file_name: str = "mega_group_gemm_combine",
     ):
-        if self.comm_backend == "nccl_gin":
+        use_nccl_gin_fused_combine = self.comm_backend == "nccl_gin" and os.environ.get(
+            "TRITON_DIST_NCCL_GIN_FUSED_COMBINE", "1") != "0"
+        if self.comm_backend == "nccl_gin" and (not use_nccl_gin_fused_combine or combine_mode != "fuse_scatter"):
             return self._fallback_combine_group_gemm_nccl_gin(
                 gemm_input_data, gemm_weight, ep_a2a_layout_desc, gemm_weight_reduce_last_dim, gate_input,
                 combine_output, output_gate, grad_weight)
@@ -1137,6 +1198,11 @@ class EpAll2AllFusedOp(torch.nn.Module):
 
         COMBINE_SM = optional_sm if optional_sm is not None else self.num_sm
         MEGA_SMS = self.MAX_SMS
+        if use_nccl_gin_fused_combine:
+            COMBINE_SM = int(os.environ.get("TRITON_DIST_NCCL_GIN_COMBINE_SMS", "1"))
+            num_warps = int(os.environ.get("TRITON_DIST_NCCL_GIN_COMBINE_WARPS", "4"))
+            if num_reduce_sms <= 0:
+                num_reduce_sms = int(os.environ.get("TRITON_DIST_NCCL_GIN_REDUCE_SMS", "1"))
         M = ep_a2a_layout_desc.num_dispatch_token_cur_rank
         N = self.hidden
 
@@ -1167,6 +1233,26 @@ class EpAll2AllFusedOp(torch.nn.Module):
         # for mega kernel
         # fill_tensor(self._task_counter_buf, 0, 1)
         self._task_counter_buf.zero_()
+
+        combine_num_recv_tokens_per_rank = ep_a2a_layout_desc.num_recv_tokens_per_rank
+        if use_nccl_gin_fused_combine:
+            combine_num_recv_tokens_per_rank = ep_a2a_layout_desc.recv_buf_tokens_per_expert.sum(dim=1).to(
+                dtype=self.offset_dtype)
+            from triton_dist import nccl_gin
+            nccl_gin_dev_comm = nccl_gin.get_dev_comm_tensor(gemm_input_data.device)
+            nccl_gin_combine_in_win = self._comm_allocator.get_window(self.combine_in_buf)
+            nccl_gin_scatter_output_win = self._comm_allocator.get_window(self.mega_combine_scatter_output_buf)
+            nccl_gin_gate_input_win = self._comm_allocator.get_window(self.combine_gate_in_buf)
+            nccl_gin_gate_output_win = self._comm_allocator.get_window(self.combine_gate_out_buf)
+            nccl_gin_scatter_barrier_win = self._comm_allocator.get_window(
+                self.mega_combine_scatter_output_barrier_buf)
+        else:
+            nccl_gin_dev_comm = self._task_counter_buf
+            nccl_gin_combine_in_win = 0
+            nccl_gin_scatter_output_win = 0
+            nccl_gin_gate_input_win = 0
+            nccl_gin_gate_output_win = 0
+            nccl_gin_scatter_barrier_win = 0
 
         # if tranposed group gemm is needed, we need to create the grad weight tensor
         if grad_output is not None:
@@ -1212,6 +1298,14 @@ class EpAll2AllFusedOp(torch.nn.Module):
 
         self.ep_barrier_all()
 
+        nccl_gin_combine_debug = use_nccl_gin_fused_combine and os.environ.get(
+            "TRITON_DIST_NCCL_GIN_DEBUG", "0") != "0"
+        if nccl_gin_combine_debug:
+            print(
+                f"[rank {self.rank}] nccl_gin combine launch M={M} combine_sms={COMBINE_SM} "
+                f"reduce_sms={num_reduce_sms}",
+                flush=True)
+
         if not with_grad:
             mega_kernel_moe_grouped_gemm_combine_token[grid](
                 self._task_counter_buf,
@@ -1240,7 +1334,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
 
                 # combine token params
                 ep_a2a_layout_desc.num_input_tokens_per_rank,  # [world_size]
-                ep_a2a_layout_desc.num_recv_tokens_per_rank,  # [world_size]
+                combine_num_recv_tokens_per_rank,  # [world_size]
                 self.combine_in_buf,  # symm buffer (recv token in dispatch stage)
                 self.mega_combine_scatter_output_buf,  # symm buffer [max_tokens, topk, hidden]
                 self.mega_combine_scatter_output_barrier_buf if num_reduce_sms > 0 else None,  # [max_tokens, topk, ]
@@ -1250,6 +1344,21 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 ep_a2a_layout_desc.topk_indices_tensor,  # [max_tokens, topk]
                 ep_a2a_layout_desc.token_dst_scatter_idx,  # [max_tokens, topk]
                 ep_a2a_layout_desc.reversed_token_scatter_idx,  # [max_tokens, topk, 2]
+                nccl_gin_dev_comm,
+                nccl_gin_combine_in_win,
+                nccl_gin_scatter_output_win,
+                nccl_gin_gate_input_win,
+                nccl_gin_gate_output_win,
+                nccl_gin_scatter_barrier_win,
+                self.rank,
+                self.world_size,
+                use_nccl_gin_fused_combine,
+                (use_nccl_gin_fused_combine and os.environ.get(
+                    "TRITON_DIST_NCCL_GIN_SKIP_COMBINE_PUTS", "0") != "0"),
+                (use_nccl_gin_fused_combine and os.environ.get(
+                    "TRITON_DIST_NCCL_GIN_SKIP_COMBINE_SIGNALS", "0") != "0"),
+                (use_nccl_gin_fused_combine and os.environ.get(
+                    "TRITON_DIST_NCCL_GIN_SKIP_COMBINE_REDUCE", "0") != "0"),
                 # ep_a2a_layout_desc.non_drop_token_count_tensor,  # [max_tokens, ]
                 self.topk,
                 self.hidden,
@@ -1303,7 +1412,7 @@ class EpAll2AllFusedOp(torch.nn.Module):
 
                 # combine token params
                 ep_a2a_layout_desc.num_input_tokens_per_rank,  # [world_size]
-                ep_a2a_layout_desc.num_recv_tokens_per_rank,  # [world_size]
+                combine_num_recv_tokens_per_rank,  # [world_size]
                 self.combine_in_buf,  # symm buffer (recv token in dispatch stage)
                 self.mega_combine_scatter_output_buf,  # symm buffer [max_tokens, topk, hidden]
                 self.mega_combine_scatter_output_barrier_buf if num_reduce_sms > 0 else None,  # [max_tokens, topk, ]
@@ -1313,6 +1422,21 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 ep_a2a_layout_desc.topk_indices_tensor,  # [max_tokens, topk]
                 ep_a2a_layout_desc.token_dst_scatter_idx,  # [max_tokens, topk]
                 ep_a2a_layout_desc.reversed_token_scatter_idx,  # [max_tokens, topk, 2]
+                nccl_gin_dev_comm,
+                nccl_gin_combine_in_win,
+                nccl_gin_scatter_output_win,
+                nccl_gin_gate_input_win,
+                nccl_gin_gate_output_win,
+                nccl_gin_scatter_barrier_win,
+                self.rank,
+                self.world_size,
+                use_nccl_gin_fused_combine,
+                (use_nccl_gin_fused_combine and os.environ.get(
+                    "TRITON_DIST_NCCL_GIN_SKIP_COMBINE_PUTS", "0") != "0"),
+                (use_nccl_gin_fused_combine and os.environ.get(
+                    "TRITON_DIST_NCCL_GIN_SKIP_COMBINE_SIGNALS", "0") != "0"),
+                (use_nccl_gin_fused_combine and os.environ.get(
+                    "TRITON_DIST_NCCL_GIN_SKIP_COMBINE_REDUCE", "0") != "0"),
                 # ep_a2a_layout_desc.non_drop_token_count_tensor,  # [max_tokens, ]
                 self.topk,
                 self.hidden,
@@ -1355,8 +1479,15 @@ class EpAll2AllFusedOp(torch.nn.Module):
                 num_stages=gemm_num_stages,
             )
 
+        if nccl_gin_combine_debug:
+            print(f"[rank {self.rank}] nccl_gin combine kernel launched", flush=True)
         torch.cuda.current_stream().synchronize()
+        if nccl_gin_combine_debug:
+            print(f"[rank {self.rank}] nccl_gin combine stream synchronized", flush=True)
+            print(f"[rank {self.rank}] nccl_gin combine before ep barrier", flush=True)
         self.ep_barrier_all()
+        if nccl_gin_combine_debug:
+            print(f"[rank {self.rank}] nccl_gin combine after ep barrier", flush=True)
 
         reduce_buf = self.combine_out_buf
         reduce_gate_buf = self.combine_gate_out_buf

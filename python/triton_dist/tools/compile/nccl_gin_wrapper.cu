@@ -58,6 +58,36 @@ __device__ void triton_dist_nccl_gin_put_cta_wrapper(
           ncclGin_None{}, ncclGin_None{}, ncclCoopCta{});
 }
 
+__device__ void triton_dist_nccl_gin_put_warp_wrapper(
+    void *dev_comm_ptr, unsigned long long dst_win_raw,
+    unsigned long long dst_offset, unsigned long long src_win_raw,
+    unsigned long long src_offset, unsigned long long bytes, int peer,
+    int context) {
+  ncclDevComm const *dev_comm =
+      reinterpret_cast<ncclDevComm const *>(dev_comm_ptr);
+  ncclWindow_t dst_win = reinterpret_cast<ncclWindow_t>(dst_win_raw);
+  ncclWindow_t src_win = reinterpret_cast<ncclWindow_t>(src_win_raw);
+  ncclGin gin{*dev_comm, context};
+  gin.put(ncclTeamWorld(*dev_comm), peer, dst_win, static_cast<size_t>(dst_offset),
+          src_win, static_cast<size_t>(src_offset), static_cast<size_t>(bytes),
+          ncclGin_None{}, ncclGin_None{}, ncclCoopWarp{});
+}
+
+__device__ void triton_dist_nccl_gin_put_thread_wrapper(
+    void *dev_comm_ptr, unsigned long long dst_win_raw,
+    unsigned long long dst_offset, unsigned long long src_win_raw,
+    unsigned long long src_offset, unsigned long long bytes, int peer,
+    int context) {
+  ncclDevComm const *dev_comm =
+      reinterpret_cast<ncclDevComm const *>(dev_comm_ptr);
+  ncclWindow_t dst_win = reinterpret_cast<ncclWindow_t>(dst_win_raw);
+  ncclWindow_t src_win = reinterpret_cast<ncclWindow_t>(src_win_raw);
+  ncclGin gin{*dev_comm, context};
+  gin.put(ncclTeamWorld(*dev_comm), peer, dst_win, static_cast<size_t>(dst_offset),
+          src_win, static_cast<size_t>(src_offset), static_cast<size_t>(bytes),
+          ncclGin_None{}, ncclGin_None{}, ncclCoopThread{});
+}
+
 __device__ void triton_dist_nccl_gin_get_cta_wrapper(
     void *dev_comm_ptr, unsigned long long remote_win_raw,
     unsigned long long remote_offset, unsigned long long local_win_raw,
@@ -108,6 +138,24 @@ __device__ void triton_dist_nccl_gin_put_va_signal_inc_cta_wrapper(
           ncclGin_None{}, ncclCoopCta{});
 }
 
+__device__ void triton_dist_nccl_gin_put_va_signal_inc_warp_wrapper(
+    void *dev_comm_ptr, unsigned long long dst_win_raw,
+    unsigned long long dst_offset, unsigned long long src_win_raw,
+    unsigned long long src_offset, unsigned long long bytes,
+    unsigned long long signal_win_raw, unsigned long long signal_offset,
+    int peer, int context) {
+  ncclDevComm const *dev_comm =
+      reinterpret_cast<ncclDevComm const *>(dev_comm_ptr);
+  ncclWindow_t dst_win = reinterpret_cast<ncclWindow_t>(dst_win_raw);
+  ncclWindow_t src_win = reinterpret_cast<ncclWindow_t>(src_win_raw);
+  ncclWindow_t signal_win = reinterpret_cast<ncclWindow_t>(signal_win_raw);
+  ncclGin gin{*dev_comm, context};
+  gin.put(ncclTeamWorld(*dev_comm), peer, dst_win, static_cast<size_t>(dst_offset),
+          src_win, static_cast<size_t>(src_offset), static_cast<size_t>(bytes),
+          ncclGin_VASignalInc{signal_win, static_cast<size_t>(signal_offset)},
+          ncclGin_None{}, ncclCoopWarp{});
+}
+
 __device__ void triton_dist_nccl_gin_signal_inc_cta_wrapper(
     void *dev_comm_ptr, int peer, int context, int signal) {
   ncclDevComm const *dev_comm =
@@ -150,6 +198,30 @@ __device__ void triton_dist_nccl_gin_signal_va_inc_cta_wrapper(
              ncclCoopCta{});
 }
 
+__device__ void triton_dist_nccl_gin_signal_va_inc_warp_wrapper(
+    void *dev_comm_ptr, unsigned long long signal_win_raw,
+    unsigned long long signal_offset, int peer, int context) {
+  ncclDevComm const *dev_comm =
+      reinterpret_cast<ncclDevComm const *>(dev_comm_ptr);
+  ncclWindow_t signal_win = reinterpret_cast<ncclWindow_t>(signal_win_raw);
+  ncclGin gin{*dev_comm, context};
+  gin.signal(ncclTeamWorld(*dev_comm), peer,
+             ncclGin_VASignalInc{signal_win, static_cast<size_t>(signal_offset)},
+             ncclCoopWarp{});
+}
+
+__device__ void triton_dist_nccl_gin_signal_va_inc_thread_wrapper(
+    void *dev_comm_ptr, unsigned long long signal_win_raw,
+    unsigned long long signal_offset, int peer, int context) {
+  ncclDevComm const *dev_comm =
+      reinterpret_cast<ncclDevComm const *>(dev_comm_ptr);
+  ncclWindow_t signal_win = reinterpret_cast<ncclWindow_t>(signal_win_raw);
+  ncclGin gin{*dev_comm, context};
+  gin.signal(ncclTeamWorld(*dev_comm), peer,
+             ncclGin_VASignalInc{signal_win, static_cast<size_t>(signal_offset)},
+             ncclCoopThread{});
+}
+
 __device__ void triton_dist_nccl_gin_reset_signal_cta_wrapper(
     void *dev_comm_ptr, int context, int signal) {
   ncclDevComm const *dev_comm =
@@ -174,6 +246,22 @@ __device__ void triton_dist_nccl_gin_flush_cta_wrapper(void *dev_comm_ptr,
       reinterpret_cast<ncclDevComm const *>(dev_comm_ptr);
   ncclGin gin{*dev_comm, context};
   gin.flush(ncclCoopCta{});
+}
+
+__device__ void triton_dist_nccl_gin_flush_warp_wrapper(void *dev_comm_ptr,
+                                                        int context) {
+  ncclDevComm const *dev_comm =
+      reinterpret_cast<ncclDevComm const *>(dev_comm_ptr);
+  ncclGin gin{*dev_comm, context};
+  gin.flush(ncclCoopWarp{});
+}
+
+__device__ void triton_dist_nccl_gin_flush_thread_wrapper(void *dev_comm_ptr,
+                                                          int context) {
+  ncclDevComm const *dev_comm =
+      reinterpret_cast<ncclDevComm const *>(dev_comm_ptr);
+  ncclGin gin{*dev_comm, context};
+  gin.flush(ncclCoopThread{});
 }
 
 }
