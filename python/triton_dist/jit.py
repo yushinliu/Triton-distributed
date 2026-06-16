@@ -241,10 +241,12 @@ def nvidia_stages_inspection_hook(self, stages, options, language, capability):
                 nvlink_cmds.extend(["-o", fbin_combined])
                 try:
                     subprocess.run(nvlink_cmds, check=True, close_fds=False, stderr=flog)
-                except Exception as e:
-                    import logging
-                    logging.error(f"error runing nvlink: {nvlink_cmds}")
-                    logging.exception(e)
+                except subprocess.CalledProcessError as e:
+                    with open(flog.name) as log_file:
+                        log = log_file.read()
+                    raise RuntimeError(f"nvlink failed with error code {e.returncode}\n"
+                                       f"`nvlink` stderr:\n{log}\n"
+                                       f"Repro command: {' '.join(nvlink_cmds)}") from e
             if has_device_wrapper:
                 with open(fbin_combined, "rb") as f:
                     cubin = f.read()

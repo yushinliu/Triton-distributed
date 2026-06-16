@@ -440,6 +440,27 @@ def get_nvcc():
     return _path_to_binary("nvcc")
 
 
+@functools.lru_cache()
+def get_ptxas_for_nvcc(nvcc: str):
+    env_ptxas = os.getenv("TRITON_DIST_PTXAS_PATH")
+    if env_ptxas:
+        if os.path.exists(env_ptxas):
+            return env_ptxas
+        raise RuntimeError(f"TRITON_DIST_PTXAS_PATH does not exist: {env_ptxas}")
+
+    cuda_home = os.getenv("CUDA_HOME")
+    candidates = []
+    if cuda_home:
+        candidates.append(os.path.join(cuda_home, "bin", "ptxas"))
+    candidates.append(os.path.join(os.path.dirname(nvcc), "ptxas"))
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    from triton.backends.nvidia.compiler import get_ptxas
+    return get_ptxas().path
+
+
 class NVSHMEMHelper:
 
     @staticmethod
@@ -533,7 +554,7 @@ class NVSHMEMHelper:
 
     @staticmethod
     def get_jit_nvshmem_cubin(user_ptx: str, capability: int, metadata):
-        from triton.backends.nvidia.compiler import sm_arch_from_capability, get_ptxas
+        from triton.backends.nvidia.compiler import sm_arch_from_capability
         num_warps = metadata["num_warps"]
         jit_code = NVSHMEMHelper.generate_sub_cu(user_ptx)
         NVSHMEM_HOME = NVSHMEMHelper.get_nvshmem_build_from_src_home()
@@ -559,7 +580,7 @@ class NVSHMEMHelper:
             except subprocess.CalledProcessError as e:
                 raise RuntimeError(f"PTX generation failed: {e}")
             fptx.flush()
-            ptxas = get_ptxas().path
+            ptxas = get_ptxas_for_nvcc(nvcc)
             # ptx => cubin
             ptxas_cmd = [ptxas, "-c", fptx.name, f"--gpu-name={arch}", f"-maxrregcount={maxnreg}", "-o", fbin.name]
             try:
